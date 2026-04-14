@@ -51,11 +51,11 @@ class GlobalState:
         # 展開の速さ 0.0〜1.0 (変化の頻度)
         self.evolve_speed = 0.5
         # ルートのランダム自動変化
-        self.auto_root       = False
-        self.auto_root_speed = 0.5   # 0.0〜1.0 (遅い〜速い)
+        self.auto_root      = False
+        self.auto_root_bars = 16     # 変化する小節数
         # スケールのランダム自動変化
-        self.auto_scale       = False
-        self.auto_scale_speed = 0.5
+        self.auto_scale      = False
+        self.auto_scale_bars = 16
 
     def get(self):
         with self._lock:
@@ -71,10 +71,10 @@ class GlobalState:
                 rest_prob     = dict(self.rest_prob),
                 evolve_depth     = self.evolve_depth,
                 evolve_speed     = self.evolve_speed,
-                auto_root        = self.auto_root,
-                auto_root_speed  = self.auto_root_speed,
-                auto_scale       = self.auto_scale,
-                auto_scale_speed = self.auto_scale_speed,
+                auto_root       = self.auto_root,
+                auto_root_bars  = self.auto_root_bars,
+                auto_scale      = self.auto_scale,
+                auto_scale_bars = self.auto_scale_bars,
             )
 
 STATE = GlobalState()
@@ -314,8 +314,8 @@ class EvolutionController:
         t_mod        = time.time() + random.uniform(30, 60)
         t_scale      = time.time() + random.uniform(45, 90)
         t_dens       = time.time() + random.uniform(20, 50)
-        t_auto_root  = time.time() + 5.0
-        t_auto_scale = time.time() + 5.0
+        t_auto_root  = time.time() + 1.0
+        t_auto_scale = time.time() + 1.0
 
         while self._running:
             s   = STATE.get()
@@ -378,25 +378,6 @@ class EvolutionController:
                     interval = 60 - spd * 50   # speed=0→60s, speed=1→10s
                     t_dens = now + random.uniform(interval * 0.6, interval * 1.4)
 
-            # Auto Scale (Auto Evolveとは独立して動作)
-            if s['auto_scale'] and now >= t_auto_scale:
-                opts = [k for k in SCALES if k != s['scale_name']]
-                new  = random.choice(opts)
-                with STATE._lock: STATE.scale_name = new
-                self.log(f"[Auto Scale] → {new}")
-                rspd = s['auto_scale_speed']
-                interval = 30 - rspd * 25
-                t_auto_scale = now + random.uniform(interval * 0.6, interval * 1.4)
-
-            # Auto Root (Auto Evolveとは独立して動作)
-            if s['auto_root'] and now >= t_auto_root:
-                rspd = s['auto_root_speed']
-                new_root = random.choice(list(range(36, 61)))  # C2〜C4
-                with STATE._lock: STATE.root = new_root
-                name = NOTE_NAMES[new_root % 12]
-                self.log(f"[Root] → {name}{new_root//12-1}")
-                interval = 30 - rspd * 25   # speed=0→30s, speed=1→5s
-                t_auto_root = now + random.uniform(interval * 0.6, interval * 1.4)
 
             time.sleep(0.1)
 
@@ -466,9 +447,9 @@ class Knob(tk.Canvas):
         cx  = s // 2
         cy  = s // 2
         r   = s // 2 - 4
-        gap = 60          # degrees left at bottom
-        full_extent = 360 - gap
-        start_angle = 270 - full_extent / 2   # tkinter: 0=right, CCW
+        # 0=7時 (225°) → max=5時 (315°)、時計回り
+        start_angle  = 225          # 7時の位置
+        full_extent  = -270         # 時計回り270°
 
         # トラック弧
         self.create_arc(cx-r, cy-r, cx+r, cy+r,
@@ -477,7 +458,7 @@ class Knob(tk.Canvas):
 
         # 値弧
         val_extent = self._ratio() * full_extent
-        if val_extent > 0:
+        if abs(val_extent) > 0:
             self.create_arc(cx-r, cy-r, cx+r, cy+r,
                             start=start_angle, extent=val_extent,
                             outline=self.color, width=4, style='arc')
@@ -499,13 +480,10 @@ class Knob(tk.Canvas):
                          fill=self.color, font=('Helvetica', 7, 'bold'), anchor='center')
 
     def _fmt(self):
-        r = self._ratio()
         if self.to <= 1.0:
-            return f'{int(r*100)}%'
-        elif self.to <= 127:
-            return str(int(self._val))
+            return f'{int(self._ratio()*100)}%'
         else:
-            return f'{int(r*100)}%'
+            return str(int(self._val))
 
     def _press(self, e):
         self._drag_y = e.y
@@ -540,6 +518,12 @@ class Knob(tk.Canvas):
         return self._val
 
 
+BAR_OPTIONS = [1, 2, 4, 8, 16, 32, 64]
+
+def bars_to_ms(bars, bpm):
+    """小節数をミリ秒に変換 (4/4拍子)"""
+    return int(bars * 4 * 60 / bpm * 1000)
+
 def labeled_knob(parent, label, from_, to, default, color, bg, command):
     """ノブ + 上ラベルをまとめたフレームを返す"""
     f = tk.Frame(parent, bg=bg)
@@ -559,6 +543,8 @@ class AmbientApp:
 
         self._playing = False
         self._drone = self._melody = self._sparkle = self._evo = None
+        self._current_root_lbl  = None
+        self._current_scale_lbl = None
         self._build_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
@@ -618,16 +604,15 @@ class AmbientApp:
             r.pack(fill='x', pady=1)
             for n in row_notes:
                 idx = NOTE_NAMES.index(n)
-                btn = tk.Button(
+                lbl = tk.Label(
                     r, text=n, width=3,
-                    bg='#2a2a3e' if '#' in n else '#3a3a5a',
-                    fg=C_TEXT, relief='flat',
-                    font=('Helvetica', 8, 'bold'), pady=3,
-                    activebackground=C_ACCENT,
-                    command=lambda i=idx: self._on_root(i),
+                    bg='#1e1e38' if '#' in n else '#1e2030',
+                    fg='#4a9eff', relief='flat',
+                    font=('Helvetica', 8, 'bold'), pady=4,
                     cursor='hand2')
-                btn.pack(side='left', padx=1)
-                self._note_btns[n] = btn
+                lbl.bind('<Button-1>', lambda e, i=idx: self._on_root(i))
+                lbl.pack(side='left', padx=1)
+                self._note_btns[n] = lbl
         oct_f = tk.Frame(f, bg=C_PANEL)
         oct_f.pack(fill='x', pady=(6, 0))
         tk.Label(oct_f, text='Octave', bg=C_PANEL, fg=C_MUTED,
@@ -639,6 +624,12 @@ class AmbientApp:
                            activebackground=C_PANEL,
                            command=self._on_octave).pack(side='left', padx=4)
         self._update_root_buttons()
+
+        # 現在のルート音表示
+        self._current_root_lbl = tk.Label(
+            f, text='', bg=C_PANEL, fg=C_ON,
+            font=('Helvetica', 18, 'bold'), anchor='center')
+        self._current_root_lbl.pack(fill='x', pady=(6, 0))
 
         # Randomize ボタン + Auto Root + Speed ノブ
         rand_row = tk.Frame(f, bg=C_PANEL)
@@ -655,10 +646,24 @@ class AmbientApp:
                        activebackground=C_PANEL, font=('Helvetica', 9, 'bold'),
                        command=self._on_auto_root).pack(side='left', padx=(10, 4))
 
-        _, self._root_speed_knob = labeled_knob(
-            rand_row, 'Speed', 0, 100, 50, C_EVO, C_PANEL,
-            command=self._on_root_speed)
-        self._root_speed_knob.master.pack(side='right')
+        # 小節数ボタン
+        bar_row = tk.Frame(f, bg=C_PANEL)
+        bar_row.pack(fill='x', pady=(4, 0))
+        tk.Label(bar_row, text='毎', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left')
+        self._root_bar_btns = {}
+        self._root_bars_var = tk.IntVar(value=16)
+        for b in BAR_OPTIONS:
+            lbl = tk.Label(bar_row, text=str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=6, pady=3,
+                           cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_root_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._root_bar_btns[b] = lbl
+        tk.Label(bar_row, text='小節', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._update_bar_buttons(self._root_bar_btns, 16)
 
     def _build_scale(self, parent):
         f = section(parent, 'Scale')
@@ -676,6 +681,12 @@ class AmbientApp:
                         foreground=C_TEXT, selectbackground=C_ACCENT,
                         arrowcolor=C_TEXT)
 
+        # 現在のスケール表示
+        self._current_scale_lbl = tk.Label(
+            f, text='', bg=C_PANEL, fg=C_ON,
+            font=('Helvetica', 13, 'bold'), anchor='center')
+        self._current_scale_lbl.pack(fill='x', pady=(4, 0))
+
         # Auto Scale + Speed ノブ
         auto_row = tk.Frame(f, bg=C_PANEL)
         auto_row.pack(fill='x', pady=(8, 0))
@@ -684,10 +695,24 @@ class AmbientApp:
                        bg=C_PANEL, fg=C_TEXT, selectcolor=C_PANEL,
                        activebackground=C_PANEL, font=('Helvetica', 9, 'bold'),
                        command=self._on_auto_scale).pack(side='left')
-        _, self._scale_speed_knob = labeled_knob(
-            auto_row, 'Speed', 0, 100, 50, C_EVO, C_PANEL,
-            command=self._on_scale_speed)
-        self._scale_speed_knob.master.pack(side='right')
+
+        # 小節数ボタン
+        sbar_row = tk.Frame(f, bg=C_PANEL)
+        sbar_row.pack(fill='x', pady=(4, 0))
+        tk.Label(sbar_row, text='毎', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left')
+        self._scale_bar_btns = {}
+        for b in BAR_OPTIONS:
+            lbl = tk.Label(sbar_row, text=str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=6, pady=3,
+                           cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_scale_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._scale_bar_btns[b] = lbl
+        tk.Label(sbar_row, text='小節', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._update_bar_buttons(self._scale_bar_btns, 16)
 
     def _build_density(self, parent):
         f = section(parent, 'Density')
@@ -795,17 +820,30 @@ class AmbientApp:
     def _on_auto_root(self):
         with STATE._lock: STATE.auto_root = self._auto_root_var.get()
 
-    def _on_root_speed(self, val):
-        with STATE._lock: STATE.auto_root_speed = int(val) / 100.0
+    def _on_root_bars(self, val):
+        with STATE._lock: STATE.auto_root_bars = val
+        self._update_bar_buttons(self._root_bar_btns, val)
+
+    def _on_scale_bars(self, val):
+        with STATE._lock: STATE.auto_scale_bars = val
+        self._update_bar_buttons(self._scale_bar_btns, val)
+
+    def _update_bar_buttons(self, btns, selected):
+        colors = {1: '#ff6b6b', 2: '#ffa94d', 4: '#ffe066',
+                  8: '#69db7c', 16: '#4dabf7', 32: '#cc5de8', 64: '#f783ac'}
+        for b, btn in btns.items():
+            if b == selected:
+                btn.config(bg=colors.get(b, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 10, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff',
+                           font=('Helvetica', 8))
 
     def _on_scale(self, _=None):
         with STATE._lock: STATE.scale_name = self._scale_var.get()
 
     def _on_auto_scale(self):
         with STATE._lock: STATE.auto_scale = self._auto_scale_var.get()
-
-    def _on_scale_speed(self, val):
-        with STATE._lock: STATE.auto_scale_speed = int(val) / 100.0
 
     def _on_density(self):
         with STATE._lock: STATE.density = self._density_var.get()
@@ -831,12 +869,35 @@ class AmbientApp:
     def _on_rest(self, key, val):
         with STATE._lock: STATE.rest_prob[key] = int(val) / 100.0
 
+    # 音名ごとの色（虹順）
+    NOTE_COLORS = {
+        'C':  '#ff6b6b', 'C#': '#ff8c42',
+        'D':  '#ffd166', 'D#': '#c9f07a',
+        'E':  '#69db7c',
+        'F':  '#4dabf7', 'F#': '#748ffc',
+        'G':  '#da77f2', 'G#': '#f783ac',
+        'A':  '#ff6b6b', 'A#': '#ff8c42',
+        'B':  '#ffd166',
+    }
+
     def _update_root_buttons(self):
-        current_name = NOTE_NAMES[STATE.root % 12]
+        root = STATE.root
+        current_name = NOTE_NAMES[root % 12]
+        octave = root // 12 - 1
         for name, btn in self._note_btns.items():
             is_sharp = '#' in name
-            btn.config(bg=C_ACCENT if name == current_name
-                       else ('#2a2a3e' if is_sharp else '#3a3a5a'))
+            if name == current_name:
+                col = self.NOTE_COLORS.get(name, C_ACCENT)
+                btn.config(bg=col, fg='#0f0f1e',
+                           font=('Helvetica', 9, 'bold'))
+            else:
+                btn.config(bg='#1e1e38' if is_sharp else '#1e2030',
+                           fg='#4a9eff',
+                           font=('Helvetica', 8, 'normal'))
+        if self._current_root_lbl:
+            col = self.NOTE_COLORS.get(current_name, C_ON)
+            self._current_root_lbl.config(
+                text=f'{current_name}{octave}', fg=col)
 
     # ---- 再生 / 停止 ------------------------------------
     def _toggle_play(self):
@@ -861,7 +922,8 @@ class AmbientApp:
         threading.Timer(2.0, self._melody.start).start()
         threading.Timer(4.0, self._sparkle.start).start()
         threading.Timer(5.0, self._evo.start).start()
-        self.root.after(500, self._sync_ui)
+        self.root.after(300, self._sync_ui)
+        self.root.after(1000, self._auto_tick)
 
     def _stop(self):
         global _midi_muted
@@ -876,6 +938,53 @@ class AmbientApp:
             if layer: layer.stop()
         self.root.after(400, midi_panic)  # 念のため再度消音
 
+    def _auto_tick(self):
+        """起動時に Auto Root / Auto Scale の独立タイマーをキックオフ"""
+        if not self._playing:
+            return
+        self.root.after(500, self._auto_root_tick)
+        self.root.after(500, self._auto_scale_tick)
+
+    def _auto_root_tick(self):
+        if not self._playing:
+            return
+        s = STATE.get()
+        if s['auto_root']:
+            new_root = random.choice(list(range(36, 61)))
+            with STATE._lock: STATE.root = new_root
+            name = NOTE_NAMES[new_root % 12]
+            # 次の小節数をランダム選択
+            next_bars = random.choice(BAR_OPTIONS)
+            with STATE._lock: STATE.auto_root_bars = next_bars
+            self._update_bar_buttons(self._root_bar_btns, next_bars)
+            self._log(f"[Auto Root] → {name}{new_root//12-1}  次: {next_bars}小節後")
+            self._update_root_buttons()
+            interval = bars_to_ms(next_bars, s['bpm'])
+        else:
+            interval = 500
+        self.root.after(interval, self._auto_root_tick)
+
+    def _auto_scale_tick(self):
+        if not self._playing:
+            return
+        s = STATE.get()
+        if s['auto_scale']:
+            opts = [k for k in SCALES if k != s['scale_name']]
+            new = random.choice(opts)
+            with STATE._lock: STATE.scale_name = new
+            self._scale_var.set(new)
+            if self._current_scale_lbl:
+                self._current_scale_lbl.config(text=new)
+            # 次の小節数をランダム選択
+            next_bars = random.choice(BAR_OPTIONS)
+            with STATE._lock: STATE.auto_scale_bars = next_bars
+            self._update_bar_buttons(self._scale_bar_btns, next_bars)
+            self._log(f"[Auto Scale] → {new}  次: {next_bars}小節後")
+            interval = bars_to_ms(next_bars, s['bpm'])
+        else:
+            interval = 500
+        self.root.after(interval, self._auto_scale_tick)
+
     def _sync_ui(self):
         if not self._playing: return
         s = STATE.get()
@@ -885,8 +994,9 @@ class AmbientApp:
             self._auto_scale_var.set(s['auto_scale'])
         if self._density_var.get() != s['density']:
             self._density_var.set(s['density'])
+        self._current_scale_lbl.config(text=s['scale_name'])
         self._update_root_buttons()
-        self.root.after(500, self._sync_ui)
+        self.root.after(300, self._sync_ui)
 
     # ---- ログ -------------------------------------------
     def _log(self, msg):
