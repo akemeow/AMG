@@ -53,6 +53,9 @@ class GlobalState:
         # ルートのランダム自動変化
         self.auto_root       = False
         self.auto_root_speed = 0.5   # 0.0〜1.0 (遅い〜速い)
+        # スケールのランダム自動変化
+        self.auto_scale       = False
+        self.auto_scale_speed = 0.5
 
     def get(self):
         with self._lock:
@@ -70,6 +73,8 @@ class GlobalState:
                 evolve_speed     = self.evolve_speed,
                 auto_root        = self.auto_root,
                 auto_root_speed  = self.auto_root_speed,
+                auto_scale       = self.auto_scale,
+                auto_scale_speed = self.auto_scale_speed,
             )
 
 STATE = GlobalState()
@@ -306,10 +311,11 @@ class EvolutionController:
         self._phase   = 0.0
 
     def _loop(self):
-        t_mod       = time.time() + random.uniform(30, 60)
-        t_scale     = time.time() + random.uniform(45, 90)
-        t_dens      = time.time() + random.uniform(20, 50)
-        t_auto_root = time.time() + 5.0
+        t_mod        = time.time() + random.uniform(30, 60)
+        t_scale      = time.time() + random.uniform(45, 90)
+        t_dens       = time.time() + random.uniform(20, 50)
+        t_auto_root  = time.time() + 5.0
+        t_auto_scale = time.time() + 5.0
 
         while self._running:
             s   = STATE.get()
@@ -371,6 +377,16 @@ class EvolutionController:
                     self.log(f"[展開] 密度 → {new}")
                     interval = 60 - spd * 50   # speed=0→60s, speed=1→10s
                     t_dens = now + random.uniform(interval * 0.6, interval * 1.4)
+
+            # Auto Scale (Auto Evolveとは独立して動作)
+            if s['auto_scale'] and now >= t_auto_scale:
+                opts = [k for k in SCALES if k != s['scale_name']]
+                new  = random.choice(opts)
+                with STATE._lock: STATE.scale_name = new
+                self.log(f"[Auto Scale] → {new}")
+                rspd = s['auto_scale_speed']
+                interval = 30 - rspd * 25
+                t_auto_scale = now + random.uniform(interval * 0.6, interval * 1.4)
 
             # Auto Root (Auto Evolveとは独立して動作)
             if s['auto_root'] and now >= t_auto_root:
@@ -660,6 +676,19 @@ class AmbientApp:
                         foreground=C_TEXT, selectbackground=C_ACCENT,
                         arrowcolor=C_TEXT)
 
+        # Auto Scale + Speed ノブ
+        auto_row = tk.Frame(f, bg=C_PANEL)
+        auto_row.pack(fill='x', pady=(8, 0))
+        self._auto_scale_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(auto_row, text='Auto Scale', variable=self._auto_scale_var,
+                       bg=C_PANEL, fg=C_TEXT, selectcolor=C_PANEL,
+                       activebackground=C_PANEL, font=('Helvetica', 9, 'bold'),
+                       command=self._on_auto_scale).pack(side='left')
+        _, self._scale_speed_knob = labeled_knob(
+            auto_row, 'Speed', 0, 100, 50, C_EVO, C_PANEL,
+            command=self._on_scale_speed)
+        self._scale_speed_knob.master.pack(side='right')
+
     def _build_density(self, parent):
         f = section(parent, 'Density')
         f.pack(fill='x', pady=(0, 6))
@@ -772,6 +801,12 @@ class AmbientApp:
     def _on_scale(self, _=None):
         with STATE._lock: STATE.scale_name = self._scale_var.get()
 
+    def _on_auto_scale(self):
+        with STATE._lock: STATE.auto_scale = self._auto_scale_var.get()
+
+    def _on_scale_speed(self, val):
+        with STATE._lock: STATE.auto_scale_speed = int(val) / 100.0
+
     def _on_density(self):
         with STATE._lock: STATE.density = self._density_var.get()
 
@@ -846,6 +881,8 @@ class AmbientApp:
         s = STATE.get()
         if self._scale_var.get() != s['scale_name']:
             self._scale_var.set(s['scale_name'])
+        if self._auto_scale_var.get() != s['auto_scale']:
+            self._auto_scale_var.set(s['auto_scale'])
         if self._density_var.get() != s['density']:
             self._density_var.set(s['density'])
         self._update_root_buttons()
