@@ -43,6 +43,50 @@ SCALES = {
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 MODULATION_INTERVALS = [-5, -2, 2, 5, 7]
 
+CHORD_DEGREES = [
+    ('Ⅰ',   0),
+    ('Ⅱ',   2),
+    ('♭Ⅲ',  3),
+    ('Ⅲ',   4),
+    ('Ⅳ',   5),
+    ('Ⅴ',   7),
+    ('♭Ⅶ',  10),
+    ('Ⅶ',   11),
+]
+
+CHORD_QUALITIES = [
+    ('maj',   [0, 4, 7]),
+    ('m',     [0, 3, 7]),
+    ('M7',    [0, 4, 7, 11]),
+    ('m7',    [0, 3, 7, 10]),
+    ('sus4',  [0, 5, 7]),
+    ('7',     [0, 4, 7, 10]),
+    ('dim',   [0, 3, 6]),
+    ('m7♭5',  [0, 3, 6, 10]),
+]
+
+CHORD_DEGREE_COLOR = {
+    0:  '#ff6b6b',
+    2:  '#ffd166',
+    3:  '#c9f07a',
+    4:  '#69db7c',
+    5:  '#4dabf7',
+    7:  '#748ffc',
+    10: '#ffa94d',
+    11: '#f783ac',
+}
+
+CHORD_QUALITY_COLOR = {
+    'maj':   '#e0e0ff',
+    'm':     '#a9e4ff',
+    'M7':    '#ffd166',
+    'm7':    '#69db7c',
+    'sus4':  '#ff9f43',
+    '7':     '#ff6b6b',
+    'dim':   '#f783ac',
+    'm7♭5':  '#da77f2',
+}
+
 # ================================================================
 # グローバルステート
 # ================================================================
@@ -73,8 +117,16 @@ class GlobalState:
         self.chord_quality = [0, 4, 7]  # maj
         self.chord_auto    = False
         self.chord_auto_bars = 8
+        # AUTO CHORD 用ランダムプール（デフォルト全選択）
+        self.chord_auto_degrees_pool  = [s for _, s in CHORD_DEGREES]
+        self.chord_auto_qualities_pool = [k for k, _ in CHORD_QUALITIES]
         self.chord_rest_bars        = 4      # 休符の長さ（小節数）
         self.chord_rest_bars_random = False  # Trueのとき休符ごとにランダム選択
+        self.arp_swing          = 0.5    # 0.5=ストレート, 0.75=ヘビースイング
+        self.melody_speed         = 1.0    # メロディーノート長倍率
+        self.melody_speed_random  = False  # Trueのとき自動ランダム切り替え
+        self.melody_speed_rand_min = 0.25  # ランダム範囲 下限
+        self.melody_speed_rand_max = 4.0   # ランダム範囲 上限
         # 全パラメーター自動ランダム切り替え
         self.arp_auto      = False
         self.arp_auto_bars = 4        # 何小節ごとに切り替えるか
@@ -119,10 +171,17 @@ class GlobalState:
                 chord_quality = list(self.chord_quality),
                 chord_auto    = self.chord_auto,
                 chord_auto_bars = self.chord_auto_bars,
+                chord_auto_degrees_pool   = list(self.chord_auto_degrees_pool),
+                chord_auto_qualities_pool = list(self.chord_auto_qualities_pool),
                 arp_auto        = self.arp_auto,
                 arp_auto_bars   = self.arp_auto_bars,
                 chord_rest_bars        = self.chord_rest_bars,
                 chord_rest_bars_random = self.chord_rest_bars_random,
+                arp_swing             = self.arp_swing,
+                melody_speed           = self.melody_speed,
+                melody_speed_random    = self.melody_speed_random,
+                melody_speed_rand_min  = self.melody_speed_rand_min,
+                melody_speed_rand_max  = self.melody_speed_rand_max,
             )
 
 STATE = GlobalState()
@@ -222,27 +281,32 @@ class MidiClockReceiver:
 
     def __init__(self, on_bpm_change):
         self._on_bpm_change = on_bpm_change
-        self._midi_in  = None
-        self._running  = False
-        self._last_t   = None
+        self._midi_in   = None
+        self._running   = False
+        self._last_t    = None
         self._intervals = []
-        self._N        = 24   # 平均化パルス数（1拍分）
+        self._N         = 24   # 1拍分（ジッター平均化に十分なサンプル数）
+        self._ema_bpm   = None  # 指数移動平均BPM（内部用float）
+        self._last_fired = None # 最後に通知したBPM整数値（ヒステリシス用）
 
-    def start(self):
+    def start(self, log_fn=None):
+        self._log = log_fn or print
         try:
             self._midi_in = rtmidi.MidiIn()
             ports = self._midi_in.get_ports()
+            self._log(f"[SLAVE] MidiIn ports: {ports}")
             iac = next((i for i, p in enumerate(ports) if 'IAC' in p), None)
             if iac is None:
+                self._log("[SLAVE] IAC port not found!")
                 return False
             self._midi_in.open_port(iac)
-            # timing=False にするとクロックを無視してしまうので False を渡す
+            self._log(f"[SLAVE] Opened: {ports[iac]}")
             self._midi_in.ignore_types(sysex=True, timing=False, active_sense=True)
             self._running = True
             self._midi_in.set_callback(self._callback)
             return True
         except Exception as e:
-            print(f"MidiClockReceiver start error: {e}")
+            self._log(f"[SLAVE] start error: {e}")
             return False
 
     def stop(self):
@@ -262,23 +326,50 @@ class MidiClockReceiver:
             return
         msg, _ = message
         if msg[0] == 0xF8:   # MIDI Clock (24 pulses per quarter note)
+            self._pulse_count = getattr(self, '_pulse_count', 0) + 1
+            if self._pulse_count == 1:
+                self._log("[SLAVE] クロック受信開始 ✓")
+            elif self._pulse_count == self._N + 1:
+                self._log(f"[SLAVE] クロック安定 ({self._N}+ pulses)")
             now = time.time()
             if self._last_t is not None:
                 interval = now - self._last_t
-                # BPM 20〜300 の範囲外は無視
+                # BPM 20〜300 の範囲外は無視（異常なスパイクを除外）
                 if 0.005 < interval < 0.15:
                     self._intervals.append(interval)
                     if len(self._intervals) > self._N:
                         self._intervals.pop(0)
-                    if len(self._intervals) >= 8:
-                        avg = sum(self._intervals) / len(self._intervals)
-                        bpm = int(round(60.0 / (avg * 24)))
-                        bpm = max(20, min(300, bpm))
-                        self._on_bpm_change(bpm)
+                    if len(self._intervals) >= self._N:
+                        # 単純平均で生BPMを算出
+                        avg     = sum(self._intervals) / len(self._intervals)
+                        raw_bpm = 60.0 / (avg * 24)
+                        raw_bpm = max(20.0, min(300.0, raw_bpm))
+
+                        # EMA（指数移動平均）でなだらかに追従 α=0.15
+                        if self._ema_bpm is None:
+                            self._ema_bpm = raw_bpm
+                        else:
+                            self._ema_bpm = 0.15 * raw_bpm + 0.85 * self._ema_bpm
+
+                        # ヒステリシス: 前回と1BPM以上変化した時だけ通知
+                        new_int = int(round(self._ema_bpm))
+                        if self._last_fired is None or abs(new_int - self._last_fired) >= 1:
+                            self._last_fired = new_int
+                            self._on_bpm_change(new_int)
             self._last_t = now
         elif msg[0] == 0xFC:  # MIDI Stop — クロックリセット
+            self._log("[SLAVE] MIDI Stop 受信 → クロックリセット")
             self._intervals.clear()
-            self._last_t = None
+            self._last_t    = None
+            self._ema_bpm   = None
+            self._last_fired = None
+            self._pulse_count = 0
+        else:
+            # 最初の5件だけ未知メッセージを記録
+            count = getattr(self, '_unknown_count', 0)
+            if count < 5:
+                self._log(f"[SLAVE] other msg: {[hex(b) for b in msg]}")
+            self._unknown_count = count + 1
 
 def get_midi():
     global _midiout
@@ -428,7 +519,6 @@ class MelodyLayer:
                 time.sleep(0.5)
                 continue
 
-            beat      = 60.0 / s['bpm']
             var       = s['variation'][key]
             rest_prob = s['rest_prob'][key]
 
@@ -443,7 +533,10 @@ class MelodyLayer:
 
             note  = self._notes[self._deg]
             dur_b = wchoice(self.DENSITY_DUR[s['density']])
-            dur_s = dur_b * beat
+            beat  = 60.0 / STATE.bpm   # ノートごとに BPM 直読み → SLAVE追従
+            # melody レイヤーのみ speed 倍率を適用
+            speed = s['melody_speed'] if self.layer_key == 'melody' else 1.0
+            dur_s = dur_b * beat * speed
             vel   = int((s['vel'][key] + random.randint(-15, 15)) * s['dynamic'])
 
             if random.random() < rest_prob:
@@ -597,14 +690,19 @@ class ChordLayer:
         return notes
 
     def _loop(self):
+        # 連続タイムライン: サイクル終了時刻を次のサイクル開始時刻として引き継ぐ
+        # → STATE読み込みや音符構築の処理時間に引きずられない
+        next_cycle_t = time.perf_counter()
+
         while self._running:
             s = STATE.get()
             if not s['layers'].get('chord', True):
                 midi_all_off(self.ch)
+                next_cycle_t = time.perf_counter()
                 time.sleep(0.2)
                 continue
 
-            beat      = 60.0 / s['bpm']
+            beat      = 60.0 / STATE.bpm
             root      = s['root']
             arp_on    = s['arp_on']
             arp_mode  = s['arp_mode']
@@ -633,6 +731,7 @@ class ChordLayer:
                 self._cur_quality    = quality
 
             if not self._chord_notes:
+                next_cycle_t = time.perf_counter()
                 time.sleep(0.2)
                 continue
 
@@ -641,7 +740,9 @@ class ChordLayer:
             if rest_bars > 0 and random.random() < rest_prob:
                 if s['chord_rest_bars_random']:
                     rest_bars = random.choice([1, 2, 4, 8, 16])
-                self._interruptible_sleep(beat * 4 * rest_bars)
+                rest_dur = beat * 4 * rest_bars
+                next_cycle_t += rest_dur
+                self._sleep_until(next_cycle_t)
                 continue
 
             notes = list(self._chord_notes)
@@ -658,30 +759,75 @@ class ChordLayer:
                     seq = notes[:]
                     random.shuffle(seq)
 
+                # サイクルのステップ長・スイングを確定（BPM変化は次サイクルから反映）
+                step      = arp_rate * beat
+                swing     = s['arp_swing']   # 0.5=straight, 0.75=heavy swing
+                cycle_dur = len(seq) * step
+
+                # 遅れすぎた場合はタイムラインをリセット（最大 1ステップ分まで許容）
+                now = time.perf_counter()
+                if next_cycle_t < now - step:
+                    next_cycle_t = now
+
                 names = [NOTE_NAMES[n % 12] for n in notes]
-                self.log(f"Chord   {names}  [{arp_mode}]  {arp_rate:.2f}beat/step")
-                step = arp_rate * beat
-                for note in seq:
+                self.log(f"Chord   {names}  [{arp_mode}]  {arp_rate:.2f}beat  swing={int((swing-0.5)*200)}%")
+
+                # サイクル開始まで待機してから t0 を確定
+                self._sleep_until(next_cycle_t)
+                t0 = time.perf_counter()
+
+                gate = step * 0.82
+                for i, note in enumerate(seq):
+                    if not self._running:
+                        break
+                    # スイング: 偶数ノートはそのまま、奇数ノートは遅らせる
+                    # pair * 2*step + pos * 2*step*swing で三連符感を出す
+                    pair  = i // 2
+                    pos   = i % 2
+                    on_t  = t0 + pair * 2 * step + pos * 2 * step * swing
+                    off_t = on_t + gate
+
+                    self._sleep_until(on_t)
                     if not self._running:
                         break
                     midi_on(self.ch, note, vel)
-                    self._interruptible_sleep(step * 0.82)
+
+                    self._sleep_until(off_t)
+                    if not self._running:
+                        break
                     midi_off(self.ch, note)
-                    self._interruptible_sleep(step * 0.18)
+
+                # タイムラインを前進（サイクル長ぴったり）
+                next_cycle_t += cycle_dur
+
             else:
                 names = [NOTE_NAMES[n % 12] for n in notes]
                 dur   = wchoice({4.0: 2, 8.0: 3, 16.0: 1})
                 self.log(f"Chord   {names}  [block]  {dur}拍")
+                self._sleep_until(next_cycle_t)
+                t0 = time.perf_counter()
                 for note in notes:
                     midi_on(self.ch, note, vel)
-                self._interruptible_sleep(beat * dur * 0.88)
+                self._sleep_until(t0 + beat * dur * 0.88)
                 for note in notes:
                     midi_off(self.ch, note)
+                next_cycle_t += beat * dur
 
-    def _interruptible_sleep(self, duration):
-        end = time.time() + duration
-        while self._running and time.time() < end:
-            time.sleep(0.02)
+    def _sleep_until(self, target_t):
+        """高精度絶対時刻待機
+        遠い(>5ms)  : 1ms スリープ  → GIL を解放しつつ CPU 使用を抑える
+        近い(>1ms)  : 0.2ms スリープ → オーバーシュートを最小化
+        最後 1ms    : スピン         → サブミリ秒精度
+        """
+        while self._running:
+            remaining = target_t - time.perf_counter()
+            if remaining <= 0:
+                break
+            elif remaining > 0.005:
+                time.sleep(0.001)
+            elif remaining > 0.001:
+                time.sleep(0.0002)
+            # else: spin（最後の1ms、CPU使用するが高精度）
 
     def start(self):
         self._running = True
@@ -843,51 +989,6 @@ ARP_RATE_COLORS = {
     4.0:   '#cc5de8',
 }
 
-CHORD_DEGREES = [
-    ('Ⅰ',   0),
-    ('Ⅱ',   2),
-    ('♭Ⅲ',  3),
-    ('Ⅲ',   4),
-    ('Ⅳ',   5),
-    ('Ⅴ',   7),
-    ('♭Ⅶ',  10),
-    ('Ⅶ',   11),
-]
-
-CHORD_QUALITIES = [
-    ('maj',   [0, 4, 7]),
-    ('m',     [0, 3, 7]),
-    ('M7',    [0, 4, 7, 11]),
-    ('m7',    [0, 3, 7, 10]),
-    ('sus4',  [0, 5, 7]),
-    ('7',     [0, 4, 7, 10]),
-    ('dim',   [0, 3, 6]),
-    ('m7♭5',  [0, 3, 6, 10]),
-]
-
-CHORD_DEGREE_COLOR = {
-    0:  '#ff6b6b',
-    2:  '#ffd166',
-    3:  '#c9f07a',
-    4:  '#69db7c',
-    5:  '#4dabf7',
-    7:  '#748ffc',
-    10: '#ffa94d',
-    11: '#f783ac',
-}
-
-CHORD_QUALITY_COLOR = {
-    'maj':   '#e0e0ff',
-    'm':     '#a9e4ff',
-    'M7':    '#ffd166',
-    'm7':    '#69db7c',
-    'sus4':  '#ff9f43',
-    '7':     '#ff6b6b',
-    'dim':   '#f783ac',
-    'm7♭5':  '#da77f2',
-}
-
-
 def midi_note_name(n):
     # Logic Pro convention: MIDI 0 = C-2, MIDI 24 = C0, MIDI 36 = C1
     return f"{NOTE_NAMES[n % 12]}{n // 12 - 2}"
@@ -953,6 +1054,7 @@ class AmbientApp:
         self._current_scale_lbl = None
         self._current_chord_lbl = None
         self._clock_receiver    = None   # MidiClockReceiver (slave)
+        self._tap_times         = []     # タップテンポ用タイムスタンプ
         self._clock_sender      = None   # MidiClockSender   (master)
         self._sync_mode         = 'off'  # 'off' / 'slave' / 'master'
         self._build_ui()
@@ -988,6 +1090,8 @@ class AmbientApp:
         self._build_density(left)
         self._build_layers(right)
         self._build_log(right)
+        # テンポブリンク開始（UI構築後）
+        self.root.after(100, self._bpm_blink_tick)
 
     def _build_transport(self, parent):
         f = section(parent, 'Transport')
@@ -1003,9 +1107,17 @@ class AmbientApp:
         self._play_btn.pack(side='left')
 
         _, self._bpm_knob = labeled_knob(
-            row, 'BPM', 30, 140, 52, C_TEXT, C_PANEL,
+            row, 'BPM', 30, 300, 52, C_TEXT, C_PANEL,
             command=self._on_bpm)
         self._bpm_knob.master.pack(side='right', padx=(12, 0))
+
+        # TAP テンポボタン（点滅でテンポ表示）
+        self._tap_btn = tk.Button(
+            row, text='TAP', command=self._on_tap,
+            bg='#1e1e38', fg='#aaaacc', relief='flat',
+            font=('Helvetica', 9, 'bold'), padx=8, pady=4,
+            activebackground='#00c896', cursor='hand2')
+        self._tap_btn.pack(side='right', padx=(0, 4))
 
         # MIDI Clock SYNC ボタン
         self._sync_btn = tk.Label(
@@ -1057,10 +1169,11 @@ class AmbientApp:
         rand_row = tk.Frame(f, bg=C_PANEL)
         rand_row.pack(fill='x', pady=(8, 0))
 
-        tk.Button(rand_row, text='RANDOM', command=self._on_random_root,
-                  bg='#3a3a6a', fg=C_TEXT, relief='flat',
-                  font=('Helvetica', 8, 'bold'), padx=8, pady=3,
-                  activebackground=C_ACCENT, cursor='hand2').pack(side='left')
+        self._rdn_btn = tk.Button(rand_row, text='RDN', command=self._on_random_root,
+                  bg='#2a2a4a', fg='#666688', relief='flat',
+                  font=('Helvetica', 7, 'bold'), padx=5, pady=2,
+                  activebackground='#5a0000', cursor='hand2')
+        self._rdn_btn.pack(side='left')
 
         self._auto_root_var, _pb = pwr_btn(rand_row, 'Auto', C_PANEL,
                                             initial=False, command=self._on_auto_root)
@@ -1089,23 +1202,22 @@ class AmbientApp:
         f = section(parent, 'Scale')
         f.pack(fill='x', pady=(0, 6))
         self._scale_var = tk.StringVar(value='Lydian')
-        menu = ttk.Combobox(f, textvariable=self._scale_var,
-                            values=list(SCALES.keys()),
-                            state='readonly', width=22)
-        menu.pack(anchor='w')
-        menu.bind('<<ComboboxSelected>>', self._on_scale)
         style = ttk.Style()
         style.theme_use('default')
-        style.configure('TCombobox',
+        style.configure('Scale.TCombobox',
                         fieldbackground=C_SLIDER, background=C_SLIDER,
                         foreground=C_TEXT, selectbackground=C_ACCENT,
-                        arrowcolor=C_TEXT)
-
-        # 現在のスケール表示
-        self._current_scale_lbl = tk.Label(
-            f, text='', bg=C_PANEL, fg=C_ON,
-            font=('Helvetica', 13, 'bold'), anchor='center')
-        self._current_scale_lbl.pack(fill='x', pady=(4, 0))
+                        arrowcolor=C_TEXT, font=('Helvetica', 13, 'bold'))
+        style.map('Scale.TCombobox',
+                  fieldbackground=[('readonly', C_SLIDER)],
+                  foreground=[('readonly', C_TEXT)])
+        menu = ttk.Combobox(f, textvariable=self._scale_var,
+                            values=list(SCALES.keys()),
+                            style='Scale.TCombobox',
+                            state='readonly', width=20,
+                            font=('Helvetica', 13, 'bold'))
+        menu.pack(anchor='w', pady=(0, 4))
+        menu.bind('<<ComboboxSelected>>', self._on_scale)
 
         # Auto Scale + Speed ノブ
         auto_row = tk.Frame(f, bg=C_PANEL)
@@ -1275,6 +1387,28 @@ class AmbientApp:
                                      C_REST, BG, lambda v, k=key: self._on_rest(k, v))
             krest.master.pack(side='left', padx=10)
 
+            # Melody のみ Speed ボタンを追加
+            if key == 'melody':
+                spd_row = tk.Frame(block, bg=BG)
+                spd_row.pack(fill='x', pady=(6, 0))
+                tk.Label(spd_row, text='Speed', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._melody_speed_btns = {}
+                _spd_opts = [('/16', 0.0625), ('/8', 0.125), ('/4', 0.25), ('/2', 0.5), ('×1', 1.0), ('×2', 2.0), ('×4', 4.0)]
+                for lbl_text, val in _spd_opts:
+                    b = tk.Label(spd_row, text=lbl_text,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, v=val: self._on_melody_speed(v))
+                    b.pack(side='left', padx=1)
+                    self._melody_speed_btns[val] = b
+                self._melody_speed_rand_btn = tk.Label(
+                    spd_row, text='RAND', bg='#1e1e38', fg='#4a9eff', relief='flat',
+                    font=('Helvetica', 8, 'bold'), padx=6, pady=3, cursor='hand2')
+                self._melody_speed_rand_btn.bind('<Button-1>', lambda e: self._on_melody_speed_random())
+                self._melody_speed_rand_btn.pack(side='left', padx=(6, 0))
+                self._update_melody_speed_buttons(1.0)
+
             # Drone のみオクターブ選択を追加
             if key == 'drone':
                 oct_row = tk.Frame(block, bg=BG)
@@ -1350,6 +1484,22 @@ class AmbientApp:
         self._arp_rand_btn.bind('<Button-1>', lambda e: self._on_arp_rate_random())
         self._arp_rand_btn.pack(side='left', padx=(6, 0))
         self._update_arp_rate_buttons(0.25)
+
+        # Swing 行
+        swing_row = tk.Frame(block, bg=BG)
+        swing_row.pack(fill='x', pady=(2, 2))
+        tk.Label(swing_row, text='Swing', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._swing_btns = {}
+        _swing_opts = [('Str', 0.50), ('Soft', 0.58), ('Trip', 0.67), ('Hard', 0.75)]
+        for lbl_text, val in _swing_opts:
+            b = tk.Label(swing_row, text=lbl_text,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=val: self._on_arp_swing(v))
+            b.pack(side='left', padx=1)
+            self._swing_btns[val] = b
+        self._update_swing_buttons(0.50)
 
         # AUTO ランダム切り替え行
         auto_row = tk.Frame(block, bg=BG)
@@ -1453,13 +1603,14 @@ class AmbientApp:
         if self._sync_mode == 'off':
             # → SLAVE: Logic Pro がマスター、AMG が追従
             receiver = MidiClockReceiver(self._on_clock_bpm)
-            if receiver.start():
+            if receiver.start(log_fn=self._log):
                 self._clock_receiver = receiver
                 self._sync_mode = 'slave'
                 self._sync_btn.config(bg='#00b894', fg='#0f0f1e', text='◀ SLAVE')
                 self._bpm_knob.color = '#444466'
                 self._bpm_knob._draw()
                 self._log('--- SYNC: SLAVE (Logic Pro → AMG) ---')
+                self._log('※ Logic Pro を再生するとクロックが届きます')
             else:
                 self._sync_mode = 'off'
                 self._log('--- SYNC ERROR: IAC Driver が見つかりません ---')
@@ -1484,17 +1635,46 @@ class AmbientApp:
             self._log('--- SYNC OFF ---')
 
     def _on_clock_bpm(self, bpm):
-        """MIDI クロック受信スレッドから呼ばれる → UI スレッドに転送"""
-        def _update():
-            with STATE._lock:
-                STATE.bpm = bpm
-            self._bpm_knob.set(bpm)
-        self.root.after(0, _update)
+        """MIDI クロック受信スレッドから呼ばれる"""
+        # STATE はスレッドセーフ → 即時更新（UIスレッド待ちにしない）
+        with STATE._lock:
+            STATE.bpm = bpm
+        # ノブ表示だけ UIスレッド経由
+        self.root.after(0, lambda: self._bpm_knob.set(bpm))
 
     def _on_bpm(self, val):
         if self._clock_receiver is not None:
             return  # SYNC中はノブ操作を無視
         with STATE._lock: STATE.bpm = int(val)
+
+    def _on_tap(self):
+        """タップテンポ: 連続タップからBPMを算出してセット"""
+        now = time.time()
+        # 2秒以上空いたらリセット
+        if self._tap_times and (now - self._tap_times[-1]) > 2.0:
+            self._tap_times.clear()
+        self._tap_times.append(now)
+        if len(self._tap_times) > 8:
+            self._tap_times.pop(0)
+        if len(self._tap_times) >= 2:
+            intervals = [self._tap_times[i+1] - self._tap_times[i]
+                         for i in range(len(self._tap_times) - 1)]
+            avg = sum(intervals) / len(intervals)
+            bpm = int(round(60.0 / avg))
+            bpm = max(30, min(300, bpm))
+            with STATE._lock: STATE.bpm = bpm
+            self._bpm_knob.set(bpm)
+
+    def _bpm_blink_tick(self):
+        """TAPボタンを現在BPMで点滅させる（常時動作）"""
+        bpm = STATE.bpm
+        beat_ms = max(100, int(60000 / bpm))
+        # 点灯
+        self._tap_btn.config(bg='#00c896', fg='#0f0f1e')
+        # 80ms後に消灯
+        self.root.after(80, lambda: self._tap_btn.config(bg='#1e1e38', fg='#aaaacc'))
+        # 次の拍でまた点灯
+        self.root.after(beat_ms, self._bpm_blink_tick)
 
     def _on_root(self, semitone):
         new_root = semitone + self._oct_var.get() * 12
@@ -1513,7 +1693,13 @@ class AmbientApp:
         self._log(f"[Root] → {NOTE_NAMES[new_root % 12]}{new_root//12-1}")
 
     def _on_auto_root(self):
-        with STATE._lock: STATE.auto_root = self._auto_root_var.get()
+        on = self._auto_root_var.get()
+        with STATE._lock: STATE.auto_root = on
+        # RDN ボタンをアクティブ時に赤く光らせる
+        if on:
+            self._rdn_btn.config(bg='#5a0000', fg='#ff4444')
+        else:
+            self._rdn_btn.config(bg='#2a2a4a', fg='#666688')
 
     def _on_root_bars(self, val):
         with STATE._lock: STATE.auto_root_bars = val
@@ -1599,6 +1785,104 @@ class AmbientApp:
                 self._arp_rand_btn.config(bg='#1e1e38', fg='#4a9eff',
                                           font=('Helvetica', 8, 'bold'))
 
+    def _on_arp_swing(self, val):
+        with STATE._lock: STATE.arp_swing = val
+        self._update_swing_buttons(val)
+
+    def _update_swing_buttons(self, selected):
+        colors = {0.50: '#a9e4ff', 0.58: '#69db7c', 0.67: '#ffd166', 0.75: '#ff6b6b'}
+        for val, btn in self._swing_btns.items():
+            if abs(val - selected) < 0.01:
+                btn.config(bg=colors.get(val, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 8, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+
+    _SPEED_VALS = [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0]
+
+    def _on_melody_speed(self, val):
+        if STATE.melody_speed_random:
+            # RAND ON のとき: インデックス距離で近い方の境界を更新
+            with STATE._lock:
+                lo, hi = STATE.melody_speed_rand_min, STATE.melody_speed_rand_max
+                all_v  = self._SPEED_VALS
+                idx_v  = all_v.index(val)
+                idx_lo = all_v.index(lo) if lo in all_v else 0
+                idx_hi = all_v.index(hi) if hi in all_v else len(all_v) - 1
+                # インデックス距離が等しい場合は上限（hi）側を優先
+                if abs(idx_v - idx_lo) < abs(idx_v - idx_hi):
+                    STATE.melody_speed_rand_min = val
+                else:
+                    STATE.melody_speed_rand_max = val
+                # 逆転を防ぐ
+                if STATE.melody_speed_rand_min > STATE.melody_speed_rand_max:
+                    STATE.melody_speed_rand_min, STATE.melody_speed_rand_max = \
+                        STATE.melody_speed_rand_max, STATE.melody_speed_rand_min
+        else:
+            with STATE._lock:
+                STATE.melody_speed = val
+        self._update_melody_speed_buttons(STATE.melody_speed)
+
+    def _on_melody_speed_random(self):
+        new_state = not STATE.melody_speed_random
+        with STATE._lock: STATE.melody_speed_random = new_state
+        self._update_melody_speed_buttons(STATE.melody_speed)
+        if new_state:
+            self._auto_melody_speed_tick()
+
+    def _auto_melody_speed_tick(self):
+        """Speed を範囲内でランダムに自動切り替え（2〜8小節ごと）"""
+        if not self._playing:
+            return
+        if not STATE.melody_speed_random:
+            return
+        _all = [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0]
+        lo, hi = STATE.melody_speed_rand_min, STATE.melody_speed_rand_max
+        pool = [v for v in _all if lo - 0.001 <= v <= hi + 0.001]
+        if pool:
+            new_speed = random.choice(pool)
+            with STATE._lock: STATE.melody_speed = new_speed
+            self._update_melody_speed_buttons(new_speed)
+        bars = random.choice([2, 2, 4, 4, 4, 8])
+        self.root.after(bars_to_ms(bars, STATE.bpm), self._auto_melody_speed_tick)
+
+    def _update_melody_speed_buttons(self, selected):
+        colors = {0.0625: '#ff4444', 0.125: '#ff6b6b', 0.25: '#ffa94d',
+                  0.5: '#ffd166', 1.0: '#69db7c', 2.0: '#4dabf7', 4.0: '#748ffc'}
+        rand_on = STATE.melody_speed_random
+        lo = STATE.melody_speed_rand_min
+        hi = STATE.melody_speed_rand_max
+        for val, btn in self._melody_speed_btns.items():
+            in_range = rand_on and (lo - 0.001 <= val <= hi + 0.001)
+            is_sel   = abs(val - selected) < 0.001
+            if rand_on:
+                if in_range:
+                    # 範囲内: 端点は濃く、中間は薄く
+                    is_edge = abs(val - lo) < 0.001 or abs(val - hi) < 0.001
+                    if is_edge:
+                        btn.config(bg=colors.get(val, C_ON), fg='#0f0f1e',
+                                   font=('Helvetica', 8, 'bold'))
+                    else:
+                        # 中間ノード: 少し暗い色で範囲を示す
+                        btn.config(bg='#2a3a2a', fg='#88cc88',
+                                   font=('Helvetica', 8))
+                else:
+                    btn.config(bg='#1e1e38', fg='#333355', font=('Helvetica', 8))
+            else:
+                if is_sel:
+                    btn.config(bg=colors.get(val, C_ON), fg='#0f0f1e',
+                               font=('Helvetica', 8, 'bold'))
+                else:
+                    btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+        # RAND ボタン
+        if hasattr(self, '_melody_speed_rand_btn'):
+            if rand_on:
+                self._melody_speed_rand_btn.config(bg='#da77f2', fg='#0f0f1e',
+                                                   font=('Helvetica', 8, 'bold'))
+            else:
+                self._melody_speed_rand_btn.config(bg='#1e1e38', fg='#4a9eff',
+                                                   font=('Helvetica', 8, 'bold'))
+
     def _on_drone_octave(self, val):
         with STATE._lock: STATE.drone_octave = val
         self._update_drone_oct_buttons(val)
@@ -1620,17 +1904,44 @@ class AmbientApp:
         with STATE._lock: STATE.chord_oct_range = self._chord_oct_range_var.get()
 
     def _on_chord_degree(self, semitone):
-        with STATE._lock: STATE.chord_degree = semitone
-        self._update_chord_degree_buttons(semitone)
-        deg_lbl = next((l for l, s in CHORD_DEGREES if s == semitone), str(semitone))
-        qual_lbl = next((l for l, ivs in CHORD_QUALITIES if ivs == STATE.chord_quality), '')
-        self._log(f"[Chord] → {deg_lbl}{qual_lbl}")
+        if STATE.chord_auto:
+            # AUTO ON: プールをトグル（最低1つは残す）
+            pool = list(STATE.chord_auto_degrees_pool)
+            if semitone in pool:
+                if len(pool) > 1:
+                    pool.remove(semitone)
+            else:
+                pool.append(semitone)
+            with STATE._lock:
+                STATE.chord_auto_degrees_pool = pool
+            self._update_chord_degree_buttons(STATE.chord_degree)
+        else:
+            with STATE._lock: STATE.chord_degree = semitone
+            self._update_chord_degree_buttons(semitone)
+            deg_lbl  = next((l for l, s in CHORD_DEGREES if s == semitone), str(semitone))
+            qual_lbl = next((l for l, ivs in CHORD_QUALITIES if ivs == STATE.chord_quality), '')
+            self._log(f"[Chord] → {deg_lbl}{qual_lbl}")
 
     def _on_chord_quality(self, ivs, key):
-        with STATE._lock: STATE.chord_quality = ivs
-        self._update_chord_quality_buttons(key)
-        deg_lbl = next((l for l, s in CHORD_DEGREES if s == STATE.chord_degree), '')
-        self._log(f"[Chord] → {deg_lbl}{key}")
+        if STATE.chord_auto:
+            # AUTO ON: プールをトグル（最低1つは残す）
+            pool = list(STATE.chord_auto_qualities_pool)
+            if key in pool:
+                if len(pool) > 1:
+                    pool.remove(key)
+            else:
+                pool.append(key)
+            with STATE._lock:
+                STATE.chord_auto_qualities_pool = pool
+            qual_key = next((k for k, _, _ in self._chord_quality_btns.values()
+                             if False), 'maj')  # dummy; use current
+            self._update_chord_quality_buttons(
+                next((l for l, q in CHORD_QUALITIES if q == STATE.chord_quality), 'maj'))
+        else:
+            with STATE._lock: STATE.chord_quality = ivs
+            self._update_chord_quality_buttons(key)
+            deg_lbl = next((l for l, s in CHORD_DEGREES if s == STATE.chord_degree), '')
+            self._log(f"[Chord] → {deg_lbl}{key}")
 
     def _on_chord_auto(self):
         new = not self._chord_auto_var.get()
@@ -1640,24 +1951,53 @@ class AmbientApp:
             self._chord_auto_btn.config(bg='#da77f2', fg='#0f0f1e')
         else:
             self._chord_auto_btn.config(bg='#1e1e38', fg='#4a9eff')
+        # ボタン表示をモード切替に合わせて更新
+        cur_deg_lbl = next((l for l, s in CHORD_DEGREES if s == STATE.chord_degree), 'Ⅰ')
+        cur_qual_lbl = next((l for l, ivs in CHORD_QUALITIES if ivs == STATE.chord_quality), 'maj')
+        self._update_chord_degree_buttons(STATE.chord_degree)
+        self._update_chord_quality_buttons(cur_qual_lbl)
 
     def _on_chord_auto_bars(self, val):
         with STATE._lock: STATE.chord_auto_bars = val
         self._update_bar_buttons(self._chord_auto_bar_btns, val)
 
     def _update_chord_degree_buttons(self, selected):
+        auto_on  = STATE.chord_auto
+        pool     = STATE.chord_auto_degrees_pool
         for semitone, (btn, col) in self._chord_degree_btns.items():
-            if semitone == selected:
-                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+            if auto_on:
+                in_pool = semitone in pool
+                is_cur  = semitone == selected
+                if in_pool and is_cur:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+                elif in_pool:
+                    btn.config(bg='#2a2a3a', fg=col, font=('Helvetica', 9))
+                else:
+                    btn.config(bg='#1e1e38', fg='#333355', font=('Helvetica', 9))
             else:
-                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 9))
+                if semitone == selected:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+                else:
+                    btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 9))
 
     def _update_chord_quality_buttons(self, selected_key):
+        auto_on = STATE.chord_auto
+        pool    = STATE.chord_auto_qualities_pool
         for key, (btn, col, ivs) in self._chord_quality_btns.items():
-            if key == selected_key:
-                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 8, 'bold'))
+            if auto_on:
+                in_pool = key in pool
+                is_cur  = key == selected_key
+                if in_pool and is_cur:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 8, 'bold'))
+                elif in_pool:
+                    btn.config(bg='#2a2a3a', fg=col, font=('Helvetica', 8))
+                else:
+                    btn.config(bg='#1e1e38', fg='#333355', font=('Helvetica', 8))
             else:
-                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+                if key == selected_key:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 8, 'bold'))
+                else:
+                    btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
 
     def _on_chord_rest_bars(self, val):
         with STATE._lock:
@@ -1801,13 +2141,20 @@ class AmbientApp:
         self.root.after(400, midi_panic)  # 念のため再度消音
 
     def _auto_chord_tick(self):
-        """コード度数+クオリティをランダムに自動切り替え"""
+        """コード度数+クオリティをプール内からランダムに自動切り替え"""
         if not self._playing:
             return
         s = STATE.get()
         if s['chord_auto']:
-            new_deg_lbl, new_deg  = random.choice(CHORD_DEGREES)
-            new_qual_lbl, new_qual = random.choice(CHORD_QUALITIES)
+            # プール内の候補に絞ってランダム選択
+            deg_pool  = [(l, st) for l, st in CHORD_DEGREES
+                         if st in s['chord_auto_degrees_pool']]
+            qual_pool = [(l, ivs) for l, ivs in CHORD_QUALITIES
+                         if l in s['chord_auto_qualities_pool']]
+            if not deg_pool:  deg_pool  = list(CHORD_DEGREES)
+            if not qual_pool: qual_pool = list(CHORD_QUALITIES)
+            new_deg_lbl,  new_deg  = random.choice(deg_pool)
+            new_qual_lbl, new_qual = random.choice(qual_pool)
             with STATE._lock:
                 STATE.chord_degree  = new_deg
                 STATE.chord_quality = new_qual
@@ -1830,6 +2177,7 @@ class AmbientApp:
         self.root.after(500, self._auto_scale_tick)
         self.root.after(500, self._auto_arp_tick)
         self.root.after(500, self._auto_chord_tick)
+        self.root.after(500, self._auto_melody_speed_tick)
 
     def _auto_root_tick(self):
         if not self._playing:
@@ -1859,8 +2207,6 @@ class AmbientApp:
             new = random.choice(opts)
             with STATE._lock: STATE.scale_name = new
             self._scale_var.set(new)
-            if self._current_scale_lbl:
-                self._current_scale_lbl.config(text=new)
             # 次の小節数をランダム選択
             next_bars = random.choice(BAR_OPTIONS)
             with STATE._lock: STATE.auto_scale_bars = next_bars
@@ -1880,7 +2226,6 @@ class AmbientApp:
             self._auto_scale_var.set(s['auto_scale'])
         if self._density_var.get() != s['density']:
             self._density_var.set(s['density'])
-        self._current_scale_lbl.config(text=s['scale_name'])
         self._update_root_buttons()
         # コード表示更新
         deg  = s['chord_degree']
