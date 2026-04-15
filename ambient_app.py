@@ -40,12 +40,28 @@ class GlobalState:
         self.density    = 'normal'
         self.dynamic    = 1.0
         self.auto_evolve = True
-        self.layers     = {'drone': True,  'melody': True,  'sparkle': True}
-        self.vel        = {'drone': 45,    'melody': 38,    'sparkle': 28}
+        self.layers     = {'drone': True, 'melody': True, 'sparkle': True, 'chord': True}
+        self.vel        = {'drone': 45, 'melody': 38, 'sparkle': 28, 'chord': 55}
         # 変化量 0.0〜1.0 : 低=ステップワイズ、高=大跳躍多め
-        self.variation  = {'drone': 0.2,   'melody': 0.3,   'sparkle': 0.6}
+        self.variation  = {'drone': 0.2,   'melody': 0.3,   'sparkle': 0.6,   'chord': 0.3}
         # 休符率 0.0〜1.0
-        self.rest_prob    = {'drone': 0.0,   'melody': 0.35,  'sparkle': 0.60}
+        self.rest_prob    = {'drone': 0.0,   'melody': 0.35,  'sparkle': 0.60,  'chord': 0.20}
+        # アルペジエーター
+        self.arp_on          = True
+        self.arp_mode        = 'up'    # 'up' / 'down' / 'zigzag' / 'random'
+        self.arp_rate        = 0.25   # beats/step (BPM同期ノート値)
+        self.arp_rate_random = False  # Trueのとき毎サイクルランダム選択
+        self.chord_octave    = 1      # ベースオクターブオフセット (+1〜+3)
+        self.chord_oct_range  = 1      # 何オクターブ分アルペジオを広げるか (1〜3)
+        self.chord_degree  = 0           # Ⅰ (semitone offset)
+        self.chord_quality = [0, 4, 7]  # maj
+        self.chord_auto    = False
+        self.chord_auto_bars = 8
+        self.chord_rest_bars        = 4      # 休符の長さ（小節数）
+        self.chord_rest_bars_random = False  # Trueのとき休符ごとにランダム選択
+        # 全パラメーター自動ランダム切り替え
+        self.arp_auto      = False
+        self.arp_auto_bars = 4        # 何小節ごとに切り替えるか
         # 展開の深さ 0.0〜1.0 (転調幅・変化の大きさ)
         self.evolve_depth = 0.5
         # 展開の速さ 0.0〜1.0 (変化の頻度)
@@ -69,12 +85,27 @@ class GlobalState:
                 vel           = dict(self.vel),
                 variation     = dict(self.variation),
                 rest_prob     = dict(self.rest_prob),
+                auto_evolve      = self.auto_evolve,
                 evolve_depth     = self.evolve_depth,
                 evolve_speed     = self.evolve_speed,
                 auto_root       = self.auto_root,
                 auto_root_bars  = self.auto_root_bars,
                 auto_scale      = self.auto_scale,
                 auto_scale_bars = self.auto_scale_bars,
+                arp_on          = self.arp_on,
+                arp_mode        = self.arp_mode,
+                arp_rate        = self.arp_rate,
+                arp_rate_random = self.arp_rate_random,
+                chord_octave    = self.chord_octave,
+                chord_oct_range = self.chord_oct_range,
+                chord_degree  = self.chord_degree,
+                chord_quality = list(self.chord_quality),
+                chord_auto    = self.chord_auto,
+                chord_auto_bars = self.chord_auto_bars,
+                arp_auto        = self.arp_auto,
+                arp_auto_bars   = self.arp_auto_bars,
+                chord_rest_bars        = self.chord_rest_bars,
+                chord_rest_bars_random = self.chord_rest_bars_random,
             )
 
 STATE = GlobalState()
@@ -123,6 +154,109 @@ def wchoice(d):
 # ================================================================
 _midiout = None
 _midi_muted = False   # True のときノートオンを完全ブロック
+
+
+class MidiClockSender:
+    """AMG から Logic Pro へ MIDI クロックを送信する（AMG = マスター）"""
+
+    def __init__(self):
+        self._running = False
+
+    def start(self):
+        self._running = True
+        try:
+            get_midi().send_message([0xFA])   # MIDI Start
+        except Exception:
+            pass
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+        try:
+            get_midi().send_message([0xFC])   # MIDI Stop
+        except Exception:
+            pass
+
+    def _loop(self):
+        next_t = time.perf_counter()
+        while self._running:
+            bpm      = STATE.bpm
+            interval = 60.0 / bpm / 24       # 24パルス/拍
+            next_t  += interval
+            try:
+                get_midi().send_message([0xF8])   # MIDI Clock
+            except Exception:
+                pass
+            sleep_t = next_t - time.perf_counter()
+            if sleep_t > 0:
+                time.sleep(sleep_t)          # 必ず sleep → GIL を解放
+            else:
+                next_t = time.perf_counter() # 遅れすぎたらリセット
+                time.sleep(0)
+
+
+class MidiClockReceiver:
+    """Logic Pro から MIDI クロックを受信して BPM を同期する"""
+
+    def __init__(self, on_bpm_change):
+        self._on_bpm_change = on_bpm_change
+        self._midi_in  = None
+        self._running  = False
+        self._last_t   = None
+        self._intervals = []
+        self._N        = 24   # 平均化パルス数（1拍分）
+
+    def start(self):
+        try:
+            self._midi_in = rtmidi.MidiIn()
+            ports = self._midi_in.get_ports()
+            iac = next((i for i, p in enumerate(ports) if 'IAC' in p), None)
+            if iac is None:
+                return False
+            self._midi_in.open_port(iac)
+            # timing=False にするとクロックを無視してしまうので False を渡す
+            self._midi_in.ignore_types(sysex=True, timing=False, active_sense=True)
+            self._running = True
+            self._midi_in.set_callback(self._callback)
+            return True
+        except Exception as e:
+            print(f"MidiClockReceiver start error: {e}")
+            return False
+
+    def stop(self):
+        self._running = False
+        self._intervals.clear()
+        self._last_t = None
+        if self._midi_in:
+            try:
+                self._midi_in.cancel_callback()
+                self._midi_in.close_port()
+            except Exception:
+                pass
+            self._midi_in = None
+
+    def _callback(self, message, data=None):
+        if not self._running:
+            return
+        msg, _ = message
+        if msg[0] == 0xF8:   # MIDI Clock (24 pulses per quarter note)
+            now = time.time()
+            if self._last_t is not None:
+                interval = now - self._last_t
+                # BPM 20〜300 の範囲外は無視
+                if 0.005 < interval < 0.15:
+                    self._intervals.append(interval)
+                    if len(self._intervals) > self._N:
+                        self._intervals.pop(0)
+                    if len(self._intervals) >= 8:
+                        avg = sum(self._intervals) / len(self._intervals)
+                        bpm = int(round(60.0 / (avg * 24)))
+                        bpm = max(20, min(300, bpm))
+                        self._on_bpm_change(bpm)
+            self._last_t = now
+        elif msg[0] == 0xFC:  # MIDI Stop — クロックリセット
+            self._intervals.clear()
+            self._last_t = None
 
 def get_midi():
     global _midiout
@@ -331,19 +465,20 @@ class EvolutionController:
                 swing = 0.15 + depth * 0.4
                 STATE.dynamic = max(0.2, min(1.0, 0.6 + swing * math.sin(self._phase)))
 
-                # 転調インターバル: depthで幅を制御
+                # 転調インターバル: depthで幅を制御 (auto_root=Falseならスキップ)
                 if now >= t_mod:
-                    if depth < 0.3:
-                        iv_pool = [-2, 2]           # 小さな転調
-                    elif depth < 0.7:
-                        iv_pool = [-5, -2, 2, 5]    # 中程度
-                    else:
-                        iv_pool = MODULATION_INTERVALS  # 全範囲
-                    iv  = random.choice(iv_pool)
-                    new = max(36, min(60, s['root'] + iv))
-                    with STATE._lock: STATE.root = new
-                    self.log(f"[展開] 転調 → {NOTE_NAMES[new % 12]}{new//12-1}  (depth={int(depth*100)}%)")
-                    interval = 90 - spd * 75   # speed=0→90s, speed=1→15s
+                    if s['auto_root']:
+                        if depth < 0.3:
+                            iv_pool = [-2, 2]
+                        elif depth < 0.7:
+                            iv_pool = [-5, -2, 2, 5]
+                        else:
+                            iv_pool = MODULATION_INTERVALS
+                        iv  = random.choice(iv_pool)
+                        new = max(36, min(60, s['root'] + iv))
+                        with STATE._lock: STATE.root = new
+                        self.log(f"[展開] 転調 → {NOTE_NAMES[new % 12]}{new//12-1}  (depth={int(depth*100)}%)")
+                    interval = 90 - spd * 75
                     t_mod = now + random.uniform(interval * 0.6, interval * 1.4)
 
                 # スケール切り替え: depthが低いと関連スケールのみ
@@ -387,6 +522,130 @@ class EvolutionController:
 
     def stop(self):
         self._running = False
+
+
+class ChordLayer:
+    """Ch.4 — コード / アルペジエーター"""
+
+    def __init__(self, log_fn):
+        self.log             = log_fn
+        self.ch              = 3
+        self._running        = False
+        self._cur_root       = None
+        self._cur_oct_offset = None
+        self._cur_oct_range  = None
+        self._cur_degree     = None
+        self._cur_quality    = None
+        self._chord_notes    = []
+
+    def _build_chord(self, root, oct_offset=1, oct_range=1, degree=0, quality=None):
+        if quality is None:
+            quality = [0, 4, 7]
+        base = root + oct_offset * 12 + degree
+        notes = []
+        for oct in range(oct_range):
+            for iv in quality:
+                n = base + oct * 12 + iv
+                if 0 <= n <= 127:
+                    notes.append(n)
+        return notes
+
+    def _loop(self):
+        while self._running:
+            s = STATE.get()
+            if not s['layers'].get('chord', True):
+                midi_all_off(self.ch)
+                time.sleep(0.2)
+                continue
+
+            beat      = 60.0 / s['bpm']
+            root      = s['root']
+            arp_on    = s['arp_on']
+            arp_mode  = s['arp_mode']
+            if s['arp_rate_random']:
+                arp_rate = random.choice([0.125, 0.25, 0.5, 1.0, 2.0, 4.0])
+            else:
+                arp_rate = s['arp_rate']
+            rest_prob  = s['rest_prob']['chord']
+            vel_base   = s['vel']['chord']
+            dynamic    = s['dynamic']
+            oct_offset = s['chord_octave']
+            oct_range  = s['chord_oct_range']
+            degree     = s['chord_degree']
+            quality    = s['chord_quality']
+
+            if (root       != self._cur_root
+                    or oct_offset != self._cur_oct_offset
+                    or oct_range  != self._cur_oct_range
+                    or degree     != self._cur_degree
+                    or quality    != self._cur_quality):
+                self._chord_notes    = self._build_chord(root, oct_offset, oct_range, degree, quality)
+                self._cur_root       = root
+                self._cur_oct_offset = oct_offset
+                self._cur_oct_range  = oct_range
+                self._cur_degree     = degree
+                self._cur_quality    = quality
+
+            if not self._chord_notes:
+                time.sleep(0.2)
+                continue
+
+            # rest_bars == 0 はレストなし
+            rest_bars = s['chord_rest_bars']
+            if rest_bars > 0 and random.random() < rest_prob:
+                if s['chord_rest_bars_random']:
+                    rest_bars = random.choice([1, 2, 4, 8, 16])
+                self._interruptible_sleep(beat * 4 * rest_bars)
+                continue
+
+            notes = list(self._chord_notes)
+            vel   = max(1, min(127, int((vel_base + random.randint(-10, 10)) * dynamic)))
+
+            if arp_on:
+                if arp_mode == 'up':
+                    seq = notes
+                elif arp_mode == 'down':
+                    seq = list(reversed(notes))
+                elif arp_mode == 'zigzag':
+                    seq = notes + list(reversed(notes[1:max(1, len(notes) - 1)]))
+                else:
+                    seq = notes[:]
+                    random.shuffle(seq)
+
+                names = [NOTE_NAMES[n % 12] for n in notes]
+                self.log(f"Chord   {names}  [{arp_mode}]  {arp_rate:.2f}beat/step")
+                step = arp_rate * beat
+                for note in seq:
+                    if not self._running:
+                        break
+                    midi_on(self.ch, note, vel)
+                    self._interruptible_sleep(step * 0.82)
+                    midi_off(self.ch, note)
+                    self._interruptible_sleep(step * 0.18)
+            else:
+                names = [NOTE_NAMES[n % 12] for n in notes]
+                dur   = wchoice({4.0: 2, 8.0: 3, 16.0: 1})
+                self.log(f"Chord   {names}  [block]  {dur}拍")
+                for note in notes:
+                    midi_on(self.ch, note, vel)
+                self._interruptible_sleep(beat * dur * 0.88)
+                for note in notes:
+                    midi_off(self.ch, note)
+
+    def _interruptible_sleep(self, duration):
+        end = time.time() + duration
+        while self._running and time.time() < end:
+            time.sleep(0.02)
+
+    def start(self):
+        self._running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+        midi_all_off(self.ch)
+
+
 
 # ================================================================
 # GUI
@@ -520,6 +779,74 @@ class Knob(tk.Canvas):
 
 BAR_OPTIONS = [1, 2, 4, 8, 16, 32, 64]
 
+# アルペジエーター ノート値 (beats/step)
+ARP_RATES = [
+    ('1/32', 0.125),
+    ('1/16', 0.25),
+    ('1/8',  0.5),
+    ('1/4',  1.0),
+    ('1/2',  2.0),
+    ('1',    4.0),
+]
+ARP_RATE_COLORS = {
+    0.125: '#ff6b6b',
+    0.25:  '#ffa94d',
+    0.5:   '#ffe066',
+    1.0:   '#69db7c',
+    2.0:   '#4dabf7',
+    4.0:   '#cc5de8',
+}
+
+CHORD_DEGREES = [
+    ('Ⅰ',   0),
+    ('Ⅱ',   2),
+    ('♭Ⅲ',  3),
+    ('Ⅲ',   4),
+    ('Ⅳ',   5),
+    ('Ⅴ',   7),
+    ('♭Ⅶ',  10),
+    ('Ⅶ',   11),
+]
+
+CHORD_QUALITIES = [
+    ('maj',   [0, 4, 7]),
+    ('m',     [0, 3, 7]),
+    ('M7',    [0, 4, 7, 11]),
+    ('m7',    [0, 3, 7, 10]),
+    ('sus4',  [0, 5, 7]),
+    ('7',     [0, 4, 7, 10]),
+    ('dim',   [0, 3, 6]),
+    ('m7♭5',  [0, 3, 6, 10]),
+]
+
+CHORD_DEGREE_COLOR = {
+    0:  '#ff6b6b',
+    2:  '#ffd166',
+    3:  '#c9f07a',
+    4:  '#69db7c',
+    5:  '#4dabf7',
+    7:  '#748ffc',
+    10: '#ffa94d',
+    11: '#f783ac',
+}
+
+CHORD_QUALITY_COLOR = {
+    'maj':   '#e0e0ff',
+    'm':     '#a9e4ff',
+    'M7':    '#ffd166',
+    'm7':    '#69db7c',
+    'sus4':  '#ff9f43',
+    '7':     '#ff6b6b',
+    'dim':   '#f783ac',
+    'm7♭5':  '#da77f2',
+}
+
+
+def midi_note_name(n):
+    # Logic Pro convention: MIDI 0 = C-2, MIDI 24 = C0, MIDI 36 = C1
+    return f"{NOTE_NAMES[n % 12]}{n // 12 - 2}"
+
+
 def bars_to_ms(bars, bpm):
     """小節数をミリ秒に変換 (4/4拍子)"""
     return int(bars * 4 * 60 / bpm * 1000)
@@ -534,6 +861,39 @@ def labeled_knob(parent, label, from_, to, default, color, bg, command):
     k.pack()
     return f, k
 
+
+def pwr_btn(parent, text, bg, initial=False,
+            fg_on='#00c896', fg_off='#555577', command=None):
+    """⏻ アイコン付きトグルボタン。(BooleanVar, Frame) を返す"""
+    var = tk.BooleanVar(value=initial)
+    f   = tk.Frame(parent, bg=bg)
+    ico = tk.Label(f, text='⏻', bg=bg,
+                   fg=fg_on if initial else fg_off,
+                   font=('Helvetica', 11), cursor='hand2')
+    ico.pack(side='left')
+    lbl = tk.Label(f, text=text, bg=bg,
+                   fg=fg_on if initial else fg_off,
+                   font=('Helvetica', 9, 'bold'), cursor='hand2')
+    lbl.pack(side='left', padx=(2, 0))
+
+    def _set_visual(v):
+        c = fg_on if v else fg_off
+        ico.config(fg=c)
+        lbl.config(fg=c)
+
+    def _toggle(e=None):
+        v = not var.get()
+        var.set(v)
+        _set_visual(v)
+        if command:
+            command()
+
+    ico.bind('<Button-1>', _toggle)
+    lbl.bind('<Button-1>', _toggle)
+    # 外部から var.set() されても自動でビジュアル更新
+    var.trace_add('write', lambda *_: _set_visual(var.get()))
+    return var, f
+
 class AmbientApp:
     def __init__(self):
         self.root = tk.Tk()
@@ -542,9 +902,13 @@ class AmbientApp:
         self.root.resizable(False, False)
 
         self._playing = False
-        self._drone = self._melody = self._sparkle = self._evo = None
+        self._drone = self._melody = self._sparkle = self._evo = self._chord = None
         self._current_root_lbl  = None
         self._current_scale_lbl = None
+        self._current_chord_lbl = None
+        self._clock_receiver    = None   # MidiClockReceiver (slave)
+        self._clock_sender      = None   # MidiClockSender   (master)
+        self._sync_mode         = 'off'  # 'off' / 'slave' / 'master'
         self._build_ui()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
@@ -572,6 +936,7 @@ class AmbientApp:
         self._build_transport(left)
         self._build_key(left)
         self._build_scale(left)
+        self._build_chord_type(left)
         self._build_density(left)
         self._build_layers(right)
         self._build_log(right)
@@ -593,6 +958,15 @@ class AmbientApp:
             row, 'BPM', 30, 140, 52, C_TEXT, C_PANEL,
             command=self._on_bpm)
         self._bpm_knob.master.pack(side='right', padx=(12, 0))
+
+        # MIDI Clock SYNC ボタン
+        self._sync_btn = tk.Label(
+            row, text='SYNC', bg='#1e1e38', fg='#4a9eff',
+            font=('Helvetica', 9, 'bold'), relief='flat',
+            padx=8, pady=4, cursor='hand2')
+        self._sync_btn.pack(side='right', padx=(0, 6))
+        self._sync_btn.bind('<Button-1>', lambda e: self._toggle_bpm_sync())
+        self._clock_receiver = None
 
     def _build_key(self, parent):
         f = section(parent, 'Root Note')
@@ -640,11 +1014,9 @@ class AmbientApp:
                   font=('Helvetica', 8, 'bold'), padx=8, pady=3,
                   activebackground=C_ACCENT, cursor='hand2').pack(side='left')
 
-        self._auto_root_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(rand_row, text='Auto', variable=self._auto_root_var,
-                       bg=C_PANEL, fg=C_TEXT, selectcolor=C_PANEL,
-                       activebackground=C_PANEL, font=('Helvetica', 9, 'bold'),
-                       command=self._on_auto_root).pack(side='left', padx=(10, 4))
+        self._auto_root_var, _pb = pwr_btn(rand_row, 'Auto', C_PANEL,
+                                            initial=False, command=self._on_auto_root)
+        _pb.pack(side='left', padx=(10, 4))
 
         # 小節数ボタン
         bar_row = tk.Frame(f, bg=C_PANEL)
@@ -690,11 +1062,9 @@ class AmbientApp:
         # Auto Scale + Speed ノブ
         auto_row = tk.Frame(f, bg=C_PANEL)
         auto_row.pack(fill='x', pady=(8, 0))
-        self._auto_scale_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(auto_row, text='Auto Scale', variable=self._auto_scale_var,
-                       bg=C_PANEL, fg=C_TEXT, selectcolor=C_PANEL,
-                       activebackground=C_PANEL, font=('Helvetica', 9, 'bold'),
-                       command=self._on_auto_scale).pack(side='left')
+        self._auto_scale_var, _pb = pwr_btn(auto_row, 'Auto Scale', C_PANEL,
+                                             initial=False, command=self._on_auto_scale)
+        _pb.pack(side='left')
 
         # 小節数ボタン
         sbar_row = tk.Frame(f, bg=C_PANEL)
@@ -714,6 +1084,74 @@ class AmbientApp:
                  font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
         self._update_bar_buttons(self._scale_bar_btns, 16)
 
+    def _build_chord_type(self, parent):
+        f = section(parent, 'Chord Type')
+        f.pack(fill='x', pady=(0, 6))
+
+        # AUTO CHORD ボタン + 小節選択
+        auto_row = tk.Frame(f, bg=C_PANEL)
+        auto_row.pack(fill='x', pady=(0, 4))
+        self._chord_auto_var = tk.BooleanVar(value=False)
+        self._chord_auto_btn = tk.Label(
+            auto_row, text='AUTO CHORD', bg='#1e1e38', fg='#4a9eff',
+            relief='flat', font=('Helvetica', 9, 'bold'), padx=8, pady=3,
+            cursor='hand2')
+        self._chord_auto_btn.bind('<Button-1>', lambda e: self._on_chord_auto())
+        self._chord_auto_btn.pack(side='left')
+        tk.Label(auto_row, text='毎', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(8, 2))
+        self._chord_auto_bar_btns = {}
+        for b in [2, 4, 8, 16]:
+            lbl = tk.Label(auto_row, text=str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3,
+                           cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_chord_auto_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._chord_auto_bar_btns[b] = lbl
+        tk.Label(auto_row, text='小節', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._update_bar_buttons(self._chord_auto_bar_btns, 8)
+
+        # 度数ボタン行
+        tk.Label(f, text='Degree', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(anchor='w', padx=2)
+        deg_row = tk.Frame(f, bg=C_PANEL)
+        deg_row.pack(fill='x', pady=1)
+        self._chord_degree_btns = {}
+        for lbl_text, semitone in CHORD_DEGREES:
+            col = CHORD_DEGREE_COLOR.get(semitone, '#cccccc')
+            btn = tk.Label(deg_row, text=lbl_text, width=4,
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 9), pady=4, cursor='hand2')
+            btn.bind('<Button-1>', lambda e, s=semitone: self._on_chord_degree(s))
+            btn.pack(side='left', padx=1)
+            self._chord_degree_btns[semitone] = (btn, col)
+        self._update_chord_degree_buttons(0)
+
+        # クオリティボタン行
+        tk.Label(f, text='Quality', bg=C_PANEL, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(anchor='w', padx=2, pady=(4, 0))
+        qual_row = tk.Frame(f, bg=C_PANEL)
+        qual_row.pack(fill='x', pady=1)
+        self._chord_quality_btns = {}
+        for lbl_text, ivs in CHORD_QUALITIES:
+            col = CHORD_QUALITY_COLOR.get(lbl_text, '#cccccc')
+            key = lbl_text
+            btn = tk.Label(qual_row, text=lbl_text, width=5,
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), pady=4, cursor='hand2')
+            btn.bind('<Button-1>', lambda e, q=ivs, k=key: self._on_chord_quality(q, k))
+            btn.pack(side='left', padx=1)
+            self._chord_quality_btns[key] = (btn, col, ivs)
+        self._update_chord_quality_buttons('maj')
+
+        # 現在再生中のコード表示
+        self._current_chord_lbl = tk.Label(
+            f, text='', bg=C_PANEL, fg=C_ON,
+            font=('Helvetica', 14, 'bold'), anchor='center')
+        self._current_chord_lbl.pack(fill='x', pady=(4, 0))
+
     def _build_density(self, parent):
         f = section(parent, 'Density')
         f.pack(fill='x', pady=(0, 6))
@@ -728,12 +1166,9 @@ class AmbientApp:
         # Auto Evolve + Depth/Speed ノブ
         evo_row = tk.Frame(f, bg=C_PANEL)
         evo_row.pack(fill='x', pady=(8, 0))
-        self._evolve_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(evo_row, text='Auto Evolve',
-                       variable=self._evolve_var,
-                       bg=C_PANEL, fg=C_TEXT, selectcolor=C_PANEL,
-                       activebackground=C_PANEL, font=('Helvetica', 9, 'bold'),
-                       command=self._on_evolve).pack(side='left')
+        self._evolve_var, _pb = pwr_btn(evo_row, 'Auto Evolve', C_PANEL,
+                                         initial=True, command=self._on_evolve)
+        _pb.pack(side='left')
 
         knob_row = tk.Frame(f, bg=C_PANEL)
         knob_row.pack(fill='x', pady=(4, 0))
@@ -763,13 +1198,11 @@ class AmbientApp:
             # ヘッダー
             header = tk.Frame(block, bg=BG)
             header.pack(fill='x', pady=(0, 6))
-            lvar = tk.BooleanVar(value=True)
+            lvar, _pb = pwr_btn(header, label, BG, initial=True,
+                                fg_on=C_TEXT, fg_off='#555577',
+                                command=lambda k=key: self._on_layer(k))
             self._layer_vars[key] = lvar
-            tk.Checkbutton(header, text=label, variable=lvar,
-                           bg=BG, fg=C_TEXT, selectcolor=BG,
-                           activebackground=BG,
-                           font=('Helvetica', 10, 'bold'),
-                           command=lambda k=key: self._on_layer(k)).pack(side='left')
+            _pb.pack(side='left')
             tk.Label(header, text=ch_label, bg=BG, fg=C_MUTED,
                      font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
 
@@ -789,16 +1222,204 @@ class AmbientApp:
                                      C_REST, BG, lambda v, k=key: self._on_rest(k, v))
             krest.master.pack(side='left', padx=10)
 
+        # ---- CHORD ブロック ----
+        C_CHORD = '#7ecfe0'
+        BG = '#141428'
+        block = tk.Frame(f, bg=BG, padx=10, pady=8)
+        block.pack(fill='x', pady=3)
+
+        header = tk.Frame(block, bg=BG)
+        header.pack(fill='x', pady=(0, 6))
+        lvar, _pb = pwr_btn(header, 'CHORD', BG, initial=True,
+                            fg_on='#7ecfe0', fg_off='#555577',
+                            command=lambda: self._on_layer('chord'))
+        self._layer_vars['chord'] = lvar
+        _pb.pack(side='left')
+        tk.Label(header, text='Ch.4', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+
+        # ARP ON/OFF + モード選択
+        arp_row = tk.Frame(block, bg=BG)
+        arp_row.pack(fill='x', pady=(0, 4))
+        self._arp_var, _pb = pwr_btn(arp_row, 'ARP', BG, initial=True,
+                                     fg_on=C_CHORD, fg_off='#555577',
+                                     command=self._on_arp_on)
+        _pb.pack(side='left')
+
+        self._arp_mode_var = tk.StringVar(value='up')
+        arp_mode_cb = ttk.Combobox(arp_row, textvariable=self._arp_mode_var,
+                                   values=['up', 'down', 'zigzag', 'random'],
+                                   state='readonly', width=8)
+        arp_mode_cb.pack(side='left', padx=(8, 0))
+        arp_mode_cb.bind('<<ComboboxSelected>>', self._on_arp_mode)
+
+        # Rate ボタン行 (BPM同期ノート値)
+        rate_row = tk.Frame(block, bg=BG)
+        rate_row.pack(fill='x', pady=(0, 2))
+        tk.Label(rate_row, text='Rate', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 4))
+        self._arp_rate_btns = {}
+        for label, val in ARP_RATES:
+            lbl = tk.Label(rate_row, text=label,
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3,
+                           cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=val: self._on_arp_rate_btn(v))
+            lbl.pack(side='left', padx=1)
+            self._arp_rate_btns[val] = lbl
+        # RAND ボタン
+        self._arp_rand_var = tk.BooleanVar(value=False)
+        self._arp_rand_btn = tk.Label(rate_row, text='RAND',
+                                      bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                      font=('Helvetica', 8, 'bold'), padx=6, pady=3,
+                                      cursor='hand2')
+        self._arp_rand_btn.bind('<Button-1>', lambda e: self._on_arp_rate_random())
+        self._arp_rand_btn.pack(side='left', padx=(6, 0))
+        self._update_arp_rate_buttons(0.25)
+
+        # AUTO ランダム切り替え行
+        auto_row = tk.Frame(block, bg=BG)
+        auto_row.pack(fill='x', pady=(2, 4))
+        self._arp_auto_var = tk.BooleanVar(value=False)
+        self._arp_auto_btn = tk.Label(auto_row, text='AUTO RANDOM',
+                                      bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                      font=('Helvetica', 9, 'bold'), padx=8, pady=3,
+                                      cursor='hand2')
+        self._arp_auto_btn.bind('<Button-1>', lambda e: self._on_arp_auto())
+        self._arp_auto_btn.pack(side='left')
+        tk.Label(auto_row, text='毎', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(8, 2))
+        self._arp_auto_bar_btns = {}
+        for b in [1, 2, 4, 8, 16]:
+            lbl = tk.Label(auto_row, text=str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3,
+                           cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_arp_auto_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._arp_auto_bar_btns[b] = lbl
+        tk.Label(auto_row, text='小節', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._update_bar_buttons(self._arp_auto_bar_btns, 4)
+
+        # オクターブ設定
+        oct_row = tk.Frame(block, bg=BG)
+        oct_row.pack(fill='x', pady=(0, 4))
+        tk.Label(oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left')
+        self._chord_oct_var = tk.IntVar(value=1)
+        for o in [1, 2, 3]:
+            tk.Radiobutton(oct_row, text=str(o), variable=self._chord_oct_var, value=o,
+                           bg=BG, fg=C_TEXT, selectcolor=C_ACCENT,
+                           activebackground=BG,
+                           command=self._on_chord_octave).pack(side='left', padx=3)
+        tk.Label(oct_row, text='  Range', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(8, 0))
+        self._chord_oct_range_var = tk.IntVar(value=1)
+        for r in [1, 2, 3]:
+            tk.Radiobutton(oct_row, text=str(r), variable=self._chord_oct_range_var, value=r,
+                           bg=BG, fg=C_TEXT, selectcolor=C_ACCENT,
+                           activebackground=BG,
+                           command=self._on_chord_oct_range).pack(side='left', padx=3)
+
+        # ノブ3つ
+        knob_row = tk.Frame(block, bg=BG)
+        knob_row.pack()
+        _, kv = labeled_knob(knob_row, 'Vel', 1, 127, 55,
+                              C_CHORD, BG, lambda v: self._on_vel('chord', v))
+        kv.master.pack(side='left', padx=10)
+        _, krest = labeled_knob(knob_row, 'Rest', 0, 100, 20,
+                                 C_REST, BG, lambda v: self._on_rest('chord', v))
+        krest.master.pack(side='left', padx=10)
+
+        # 休符の長さ（小節数）
+        restbar_row = tk.Frame(block, bg=BG)
+        restbar_row.pack(fill='x', pady=(4, 0))
+        tk.Label(restbar_row, text='Rest len', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 4))
+        self._chord_rest_bar_btns = {}
+        for b in [0, 1, 2, 4, 8, 16]:
+            lbl = tk.Label(restbar_row, text='なし' if b == 0 else str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3,
+                           cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_chord_rest_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._chord_rest_bar_btns[b] = lbl
+        tk.Label(restbar_row, text='小節', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._chord_rest_rand_var = tk.BooleanVar(value=False)
+        self._chord_rest_rand_btn = tk.Label(restbar_row, text='RAND',
+                                             bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                             font=('Helvetica', 8, 'bold'), padx=6, pady=3,
+                                             cursor='hand2')
+        self._chord_rest_rand_btn.bind('<Button-1>', lambda e: self._on_chord_rest_bars_random())
+        self._chord_rest_rand_btn.pack(side='left', padx=(6, 0))
+        self._update_bar_buttons(self._chord_rest_bar_btns, 4)
+
     def _build_log(self, parent):
         f = section(parent, 'Log')
         f.pack(fill='both', expand=True)
-        self._log_text = tk.Text(f, height=10, bg='#0a0a18', fg='#6677aa',
+        self._log_text = tk.Text(f, height=6, bg='#0a0a18', fg='#6677aa',
                                   font=('Menlo', 8), relief='flat',
                                   state='disabled', wrap='none')
         self._log_text.pack(fill='both', expand=True)
 
     # ---- イベントハンドラ --------------------------------
+    def _toggle_bpm_sync(self):
+        """OFF → SLAVE → MASTER → OFF とサイクル"""
+        # 現在の状態を停止
+        if self._clock_receiver:
+            self._clock_receiver.stop()
+            self._clock_receiver = None
+        if self._clock_sender:
+            self._clock_sender.stop()
+            self._clock_sender = None
+
+        if self._sync_mode == 'off':
+            # → SLAVE: Logic Pro がマスター、AMG が追従
+            receiver = MidiClockReceiver(self._on_clock_bpm)
+            if receiver.start():
+                self._clock_receiver = receiver
+                self._sync_mode = 'slave'
+                self._sync_btn.config(bg='#00b894', fg='#0f0f1e', text='◀ SLAVE')
+                self._bpm_knob.color = '#444466'
+                self._bpm_knob._draw()
+                self._log('--- SYNC: SLAVE (Logic Pro → AMG) ---')
+            else:
+                self._sync_mode = 'off'
+                self._log('--- SYNC ERROR: IAC Driver が見つかりません ---')
+
+        elif self._sync_mode == 'slave':
+            # → MASTER: AMG がマスター、Logic Pro が追従
+            self._bpm_knob.color = C_TEXT
+            self._bpm_knob._draw()
+            sender = MidiClockSender()
+            sender.start()
+            self._clock_sender = sender
+            self._sync_mode = 'master'
+            self._sync_btn.config(bg='#ffa94d', fg='#0f0f1e', text='MASTER ▶')
+            self._log('--- SYNC: MASTER (AMG → Logic Pro) ---')
+
+        else:
+            # → OFF
+            self._sync_mode = 'off'
+            self._sync_btn.config(bg='#1e1e38', fg='#4a9eff', text='SYNC')
+            self._bpm_knob.color = C_TEXT
+            self._bpm_knob._draw()
+            self._log('--- SYNC OFF ---')
+
+    def _on_clock_bpm(self, bpm):
+        """MIDI クロック受信スレッドから呼ばれる → UI スレッドに転送"""
+        def _update():
+            with STATE._lock:
+                STATE.bpm = bpm
+            self._bpm_knob.set(bpm)
+        self.root.after(0, _update)
+
     def _on_bpm(self, val):
+        if self._clock_receiver is not None:
+            return  # SYNC中はノブ操作を無視
         with STATE._lock: STATE.bpm = int(val)
 
     def _on_root(self, semitone):
@@ -829,7 +1450,7 @@ class AmbientApp:
         self._update_bar_buttons(self._scale_bar_btns, val)
 
     def _update_bar_buttons(self, btns, selected):
-        colors = {1: '#ff6b6b', 2: '#ffa94d', 4: '#ffe066',
+        colors = {0: '#aaaaaa', 1: '#ff6b6b', 2: '#ffa94d', 4: '#ffe066',
                   8: '#69db7c', 16: '#4dabf7', 32: '#cc5de8', 64: '#f783ac'}
         for b, btn in btns.items():
             if b == selected:
@@ -869,6 +1490,150 @@ class AmbientApp:
     def _on_rest(self, key, val):
         with STATE._lock: STATE.rest_prob[key] = int(val) / 100.0
 
+    def _on_arp_on(self):
+        with STATE._lock: STATE.arp_on = self._arp_var.get()
+
+    def _on_arp_mode(self, _=None):
+        with STATE._lock: STATE.arp_mode = self._arp_mode_var.get()
+
+    def _on_arp_rate_btn(self, val):
+        with STATE._lock:
+            STATE.arp_rate        = val
+            STATE.arp_rate_random = False
+        self._arp_rand_var.set(False)
+        self._update_arp_rate_buttons(val)
+
+    def _on_arp_rate_random(self):
+        new_state = not self._arp_rand_var.get()
+        self._arp_rand_var.set(new_state)
+        with STATE._lock: STATE.arp_rate_random = new_state
+        self._update_arp_rate_buttons(STATE.arp_rate)
+
+    def _update_arp_rate_buttons(self, selected):
+        rand_on = self._arp_rand_var.get() if hasattr(self, '_arp_rand_var') else False
+        for val, btn in self._arp_rate_btns.items():
+            if not rand_on and val == selected:
+                col = ARP_RATE_COLORS.get(val, '#69db7c')
+                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+        if hasattr(self, '_arp_rand_btn'):
+            if rand_on:
+                self._arp_rand_btn.config(bg='#da77f2', fg='#0f0f1e',
+                                          font=('Helvetica', 8, 'bold'))
+            else:
+                self._arp_rand_btn.config(bg='#1e1e38', fg='#4a9eff',
+                                          font=('Helvetica', 8, 'bold'))
+
+    def _on_chord_octave(self):
+        with STATE._lock: STATE.chord_octave = self._chord_oct_var.get()
+
+    def _on_chord_oct_range(self):
+        with STATE._lock: STATE.chord_oct_range = self._chord_oct_range_var.get()
+
+    def _on_chord_degree(self, semitone):
+        with STATE._lock: STATE.chord_degree = semitone
+        self._update_chord_degree_buttons(semitone)
+        deg_lbl = next((l for l, s in CHORD_DEGREES if s == semitone), str(semitone))
+        qual_lbl = next((l for l, ivs in CHORD_QUALITIES if ivs == STATE.chord_quality), '')
+        self._log(f"[Chord] → {deg_lbl}{qual_lbl}")
+
+    def _on_chord_quality(self, ivs, key):
+        with STATE._lock: STATE.chord_quality = ivs
+        self._update_chord_quality_buttons(key)
+        deg_lbl = next((l for l, s in CHORD_DEGREES if s == STATE.chord_degree), '')
+        self._log(f"[Chord] → {deg_lbl}{key}")
+
+    def _on_chord_auto(self):
+        new = not self._chord_auto_var.get()
+        self._chord_auto_var.set(new)
+        with STATE._lock: STATE.chord_auto = new
+        if new:
+            self._chord_auto_btn.config(bg='#da77f2', fg='#0f0f1e')
+        else:
+            self._chord_auto_btn.config(bg='#1e1e38', fg='#4a9eff')
+
+    def _on_chord_auto_bars(self, val):
+        with STATE._lock: STATE.chord_auto_bars = val
+        self._update_bar_buttons(self._chord_auto_bar_btns, val)
+
+    def _update_chord_degree_buttons(self, selected):
+        for semitone, (btn, col) in self._chord_degree_btns.items():
+            if semitone == selected:
+                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 9))
+
+    def _update_chord_quality_buttons(self, selected_key):
+        for key, (btn, col, ivs) in self._chord_quality_btns.items():
+            if key == selected_key:
+                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 8, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+
+    def _on_chord_rest_bars(self, val):
+        with STATE._lock:
+            STATE.chord_rest_bars        = val
+            STATE.chord_rest_bars_random = False
+        self._chord_rest_rand_var.set(False)
+        self._chord_rest_rand_btn.config(bg='#1e1e38', fg='#4a9eff')
+        self._update_bar_buttons(self._chord_rest_bar_btns, val)
+
+    def _on_chord_rest_bars_random(self):
+        new = not self._chord_rest_rand_var.get()
+        self._chord_rest_rand_var.set(new)
+        with STATE._lock: STATE.chord_rest_bars_random = new
+        if new:
+            # RAND ON: ボタンを紫ハイライト、小節ボタンを全て未選択表示
+            self._chord_rest_rand_btn.config(bg='#da77f2', fg='#0f0f1e')
+            for btn in self._chord_rest_bar_btns.values():
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+        else:
+            self._chord_rest_rand_btn.config(bg='#1e1e38', fg='#4a9eff')
+            self._update_bar_buttons(self._chord_rest_bar_btns, STATE.chord_rest_bars)
+
+
+    def _on_arp_auto(self):
+        new = not self._arp_auto_var.get()
+        self._arp_auto_var.set(new)
+        with STATE._lock: STATE.arp_auto = new
+        if new:
+            self._arp_auto_btn.config(bg='#da77f2', fg='#0f0f1e')
+        else:
+            self._arp_auto_btn.config(bg='#1e1e38', fg='#4a9eff')
+
+    def _on_arp_auto_bars(self, val):
+        with STATE._lock: STATE.arp_auto_bars = val
+        self._update_bar_buttons(self._arp_auto_bar_btns, val)
+
+    def _auto_arp_tick(self):
+        """全アルペジエーターパラメーターをランダムに自動切り替え"""
+        if not self._playing:
+            return
+        s = STATE.get()
+        if s['arp_auto']:
+            new_mode  = random.choice(['up', 'down', 'zigzag', 'random'])
+            new_rate  = random.choice([v for _, v in ARP_RATES])
+            new_oct   = random.choice([1, 2, 3])
+            new_range = random.choice([1, 2, 3])
+            with STATE._lock:
+                STATE.arp_mode        = new_mode
+                STATE.arp_rate        = new_rate
+                STATE.arp_rate_random = False
+                STATE.chord_octave    = new_oct
+                STATE.chord_oct_range = new_range
+            # UI 同期
+            self._arp_mode_var.set(new_mode)
+            self._arp_rand_var.set(False)
+            self._chord_oct_var.set(new_oct)
+            self._chord_oct_range_var.set(new_range)
+            self._update_arp_rate_buttons(new_rate)
+            self._log(f"[ARP AUTO] mode={new_mode}  rate={new_rate}  oct={new_oct}  range={new_range}")
+            interval = bars_to_ms(s['arp_auto_bars'], s['bpm'])
+        else:
+            interval = 500
+        self.root.after(interval, self._auto_arp_tick)
+
     # 音名ごとの色（虹順）
     NOTE_COLORS = {
         'C':  '#ff6b6b', 'C#': '#ff8c42',
@@ -907,6 +1672,7 @@ class AmbientApp:
     def _start(self):
         global _midi_muted
         _midi_muted = False
+        self._log_enabled = True
         self._playing = True
         self._play_btn.config(text='  ■  STOP   ', bg='#cc4455',
                                activebackground='#aa3344')
@@ -916,12 +1682,14 @@ class AmbientApp:
         self._drone   = DroneLayer(self._log)
         self._melody  = MelodyLayer(1, 1, 'melody',  0.75, 'Melody ', self._log)
         self._sparkle = MelodyLayer(2, 3, 'sparkle', 0.55, 'Sparkle', self._log)
+        self._chord   = ChordLayer(self._log)
         self._evo     = EvolutionController(self._log)
 
         self._drone.start()
         threading.Timer(2.0, self._melody.start).start()
         threading.Timer(4.0, self._sparkle.start).start()
-        threading.Timer(5.0, self._evo.start).start()
+        threading.Timer(5.5, self._chord.start).start()
+        threading.Timer(6.0, self._evo.start).start()
         self.root.after(300, self._sync_ui)
         self.root.after(1000, self._auto_tick)
 
@@ -934,16 +1702,41 @@ class AmbientApp:
                                activebackground='#00a87d')
         self._status_lbl.config(text='● STOPPED', fg=C_OFF)
         self._log('--- 演奏停止 ---')
-        for layer in [self._drone, self._melody, self._sparkle, self._evo]:
+        self._log_enabled = False        # 以降のログをブロック
+        for layer in [self._drone, self._melody, self._sparkle, self._chord, self._evo]:
             if layer: layer.stop()
         self.root.after(400, midi_panic)  # 念のため再度消音
 
+    def _auto_chord_tick(self):
+        """コード度数+クオリティをランダムに自動切り替え"""
+        if not self._playing:
+            return
+        s = STATE.get()
+        if s['chord_auto']:
+            new_deg_lbl, new_deg  = random.choice(CHORD_DEGREES)
+            new_qual_lbl, new_qual = random.choice(CHORD_QUALITIES)
+            with STATE._lock:
+                STATE.chord_degree  = new_deg
+                STATE.chord_quality = new_qual
+            self._update_chord_degree_buttons(new_deg)
+            self._update_chord_quality_buttons(new_qual_lbl)
+            next_bars = random.choice([2, 4, 8, 16])
+            with STATE._lock: STATE.chord_auto_bars = next_bars
+            self._update_bar_buttons(self._chord_auto_bar_btns, next_bars)
+            self._log(f"[Auto Chord] → {new_deg_lbl}{new_qual_lbl}  次: {next_bars}小節後")
+            interval = bars_to_ms(next_bars, s['bpm'])
+        else:
+            interval = 500
+        self.root.after(interval, self._auto_chord_tick)
+
     def _auto_tick(self):
-        """起動時に Auto Root / Auto Scale の独立タイマーをキックオフ"""
+        """起動時に Auto Root / Auto Scale / Auto Arp / Auto Chord の独立タイマーをキックオフ"""
         if not self._playing:
             return
         self.root.after(500, self._auto_root_tick)
         self.root.after(500, self._auto_scale_tick)
+        self.root.after(500, self._auto_arp_tick)
+        self.root.after(500, self._auto_chord_tick)
 
     def _auto_root_tick(self):
         if not self._playing:
@@ -996,10 +1789,25 @@ class AmbientApp:
             self._density_var.set(s['density'])
         self._current_scale_lbl.config(text=s['scale_name'])
         self._update_root_buttons()
+        # コード表示更新
+        deg  = s['chord_degree']
+        qual = s['chord_quality']
+        deg_lbl  = next((l for l, st in CHORD_DEGREES   if st == deg),  str(deg))
+        qual_lbl = next((l for l, ivs in CHORD_QUALITIES if ivs == qual), '')
+        deg_col  = CHORD_DEGREE_COLOR.get(deg, C_ON)
+        if self._current_chord_lbl:
+            prefix = 'AUTO  ' if s['chord_auto'] else ''
+            self._current_chord_lbl.config(
+                text=f'{prefix}{deg_lbl}{qual_lbl}', fg=deg_col)
+        self._update_chord_degree_buttons(deg)
+        qual_key = next((l for l, ivs in CHORD_QUALITIES if ivs == qual), 'maj')
+        self._update_chord_quality_buttons(qual_key)
         self.root.after(300, self._sync_ui)
 
     # ---- ログ -------------------------------------------
     def _log(self, msg):
+        if not getattr(self, '_log_enabled', True):
+            return
         def _insert():
             self._log_text.config(state='normal')
             self._log_text.insert('end', msg + '\n')
@@ -1011,6 +1819,12 @@ class AmbientApp:
 
     def _on_close(self):
         self._stop()
+        if self._clock_receiver:
+            self._clock_receiver.stop()
+            self._clock_receiver = None
+        if self._clock_sender:
+            self._clock_sender.stop()
+            self._clock_sender = None
         self.root.after(300, self.root.destroy)
 
     def run(self):
