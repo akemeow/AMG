@@ -15,14 +15,29 @@ import math
 # スケール定義
 # ================================================================
 SCALES = {
-    'Lydian':            [0, 2, 4, 6, 7, 9, 11],
-    'Dorian':            [0, 2, 3, 5, 7, 9, 10],
-    'Pentatonic Minor':  [0, 3, 5, 7, 10],
-    'Pentatonic Major':  [0, 2, 4, 7, 9],
-    'Phrygian':          [0, 1, 3, 5, 7, 8, 10],
+    # ── 明るい系 ──────────────────────────────
     'Major':             [0, 2, 4, 5, 7, 9, 11],
-    'Minor':             [0, 2, 3, 5, 7, 8, 10],
+    'Lydian':            [0, 2, 4, 6, 7, 9, 11],   # #4 が浮遊感
+    'Lydian Dominant':   [0, 2, 4, 6, 7, 9, 10],   # Lydian + ♭7 幻想的
+    'Mixolydian':        [0, 2, 4, 5, 7, 9, 10],   # ♭7 ロック/ポップ
+    'Pentatonic Major':  [0, 2, 4, 7, 9],
+    # ── 暗い系 ──────────────────────────────
+    'Minor':             [0, 2, 3, 5, 7, 8, 10],   # 自然短音階
+    'Dorian':            [0, 2, 3, 5, 7, 9, 10],   # ♮6 が特徴
+    'Phrygian':          [0, 1, 3, 5, 7, 8, 10],   # ♭2 スペイン風
+    'Locrian':           [0, 1, 3, 5, 6, 8, 10],   # ♭5 非常に暗い
+    'Harmonic Minor':    [0, 2, 3, 5, 7, 8, 11],   # ♮7 ドラマチック
+    'Melodic Minor':     [0, 2, 3, 5, 7, 9, 11],   # 滑らかなマイナー
+    'Pentatonic Minor':  [0, 3, 5, 7, 10],
     'Blues':             [0, 3, 5, 6, 7, 10],
+    # ── エキゾチック系 ──────────────────────
+    'Phrygian Dominant': [0, 1, 4, 5, 7, 8, 10],   # 中東・フラメンコ
+    'Hungarian Minor':   [0, 2, 3, 6, 7, 8, 11],   # ダーク＆エキゾチック
+    'Double Harmonic':   [0, 1, 4, 5, 7, 8, 11],   # ビザンチン 非常に独特
+    'Hirajoshi':         [0, 2, 3, 7, 8],           # 日本五音音階
+    # ── 浮遊・無調系 ────────────────────────
+    'Whole Tone':        [0, 2, 4, 6, 8, 10],       # 全音音階 印象派
+    'Diminished':        [0, 2, 3, 5, 6, 8, 9, 11], # 半音全音交互
 }
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -42,6 +57,7 @@ class GlobalState:
         self.auto_evolve = True
         self.layers     = {'drone': True, 'melody': True, 'sparkle': True, 'chord': True}
         self.vel        = {'drone': 45, 'melody': 38, 'sparkle': 28, 'chord': 55}
+        self.drone_octave = 3  # ドローン絶対オクターブ (1〜5)、ルートと独立
         # 変化量 0.0〜1.0 : 低=ステップワイズ、高=大跳躍多め
         self.variation  = {'drone': 0.2,   'melody': 0.3,   'sparkle': 0.6,   'chord': 0.3}
         # 休符率 0.0〜1.0
@@ -86,6 +102,7 @@ class GlobalState:
                 variation     = dict(self.variation),
                 rest_prob     = dict(self.rest_prob),
                 auto_evolve      = self.auto_evolve,
+                drone_octave     = self.drone_octave,
                 evolve_depth     = self.evolve_depth,
                 evolve_speed     = self.evolve_speed,
                 auto_root       = self.auto_root,
@@ -154,6 +171,11 @@ def wchoice(d):
 # ================================================================
 _midiout = None
 _midi_muted = False   # True のときノートオンを完全ブロック
+
+# ── シグナルランプ ────────────────────────────────────────
+_lamp_root  = None          # tkinter root (App 起動後にセット)
+_lamp_fns   = {}            # ch (0-3) → callable(on: bool)
+_lamp_notes = [0, 0, 0, 0]  # チャンネルごとのアクティブノート数
 
 
 class MidiClockSender:
@@ -271,12 +293,23 @@ def midi_on(ch, note, vel):
     if _midi_muted:
         return
     get_midi().send_message([0x90 | ch, note, max(1, min(127, int(vel)))])
+    if ch < 4 and ch in _lamp_fns and _lamp_root:
+        _lamp_notes[ch] += 1
+        if _lamp_notes[ch] == 1:   # 最初のノートオン → ランプ点灯
+            _lamp_root.after(0, lambda c=ch: _lamp_fns[c](True))
 
 def midi_off(ch, note):
     get_midi().send_message([0x80 | ch, note, 0])
+    if ch < 4 and ch in _lamp_fns and _lamp_root:
+        _lamp_notes[ch] = max(0, _lamp_notes[ch] - 1)
+        if _lamp_notes[ch] == 0:   # 全ノートオフ → ランプ消灯
+            _lamp_root.after(0, lambda c=ch: _lamp_fns[c](False))
 
 def midi_all_off(ch):
     get_midi().send_message([0xB0 | ch, 123, 0])
+    if ch < 4 and ch in _lamp_fns and _lamp_root:
+        _lamp_notes[ch] = 0
+        _lamp_root.after(0, lambda c=ch: _lamp_fns[c](False))
 
 def midi_panic():
     """全チャンネル即時消音"""
@@ -306,7 +339,9 @@ class DroneLayer:
                 time.sleep(0.2)
                 continue
             beat = 60.0 / s['bpm']
-            root = s['root']
+            # ルートの音名（ピッチクラス）のみ使用 → ドローン独自のオクターブを適用
+            root = (s['root'] % 12) + s['drone_octave'] * 12
+            root = max(0, min(115, root))
             var  = s['variation']['drone']
 
             if root != last_root:
@@ -484,14 +519,25 @@ class EvolutionController:
                 # スケール切り替え: depthが低いと関連スケールのみ
                 if now >= t_scale:
                     RELATED = {
-                        'Lydian': ['Major', 'Dorian'],
-                        'Dorian': ['Minor', 'Phrygian', 'Lydian'],
-                        'Pentatonic Minor': ['Minor', 'Blues', 'Dorian'],
-                        'Pentatonic Major': ['Major', 'Lydian'],
-                        'Phrygian': ['Minor', 'Dorian'],
-                        'Major': ['Lydian', 'Pentatonic Major'],
-                        'Minor': ['Dorian', 'Pentatonic Minor', 'Blues'],
-                        'Blues': ['Pentatonic Minor', 'Minor'],
+                        'Major':             ['Lydian', 'Mixolydian', 'Pentatonic Major'],
+                        'Lydian':            ['Major', 'Lydian Dominant', 'Pentatonic Major'],
+                        'Lydian Dominant':   ['Lydian', 'Mixolydian', 'Whole Tone'],
+                        'Mixolydian':        ['Major', 'Dorian', 'Lydian Dominant'],
+                        'Pentatonic Major':  ['Major', 'Lydian', 'Mixolydian'],
+                        'Minor':             ['Dorian', 'Harmonic Minor', 'Pentatonic Minor', 'Blues'],
+                        'Dorian':            ['Minor', 'Phrygian', 'Melodic Minor'],
+                        'Phrygian':          ['Minor', 'Phrygian Dominant', 'Locrian'],
+                        'Locrian':           ['Phrygian', 'Diminished'],
+                        'Harmonic Minor':    ['Minor', 'Phrygian Dominant', 'Hungarian Minor'],
+                        'Melodic Minor':     ['Minor', 'Dorian', 'Lydian Dominant'],
+                        'Pentatonic Minor':  ['Minor', 'Blues', 'Dorian', 'Hirajoshi'],
+                        'Blues':             ['Pentatonic Minor', 'Minor', 'Dorian'],
+                        'Phrygian Dominant': ['Phrygian', 'Harmonic Minor', 'Double Harmonic'],
+                        'Hungarian Minor':   ['Harmonic Minor', 'Double Harmonic'],
+                        'Double Harmonic':   ['Hungarian Minor', 'Phrygian Dominant'],
+                        'Hirajoshi':         ['Pentatonic Minor', 'Phrygian'],
+                        'Whole Tone':        ['Lydian Dominant', 'Diminished'],
+                        'Diminished':        ['Whole Tone', 'Locrian', 'Phrygian'],
                     }
                     cur = s['scale_name']
                     if depth < 0.5:
@@ -910,6 +956,8 @@ class AmbientApp:
         self._clock_sender      = None   # MidiClockSender   (master)
         self._sync_mode         = 'off'  # 'off' / 'slave' / 'master'
         self._build_ui()
+        global _lamp_root
+        _lamp_root = self.root   # シグナルランプ用 after() ターゲット
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     # ---- UI構築 ----------------------------------------
@@ -1043,7 +1091,7 @@ class AmbientApp:
         self._scale_var = tk.StringVar(value='Lydian')
         menu = ttk.Combobox(f, textvariable=self._scale_var,
                             values=list(SCALES.keys()),
-                            state='readonly', width=20)
+                            state='readonly', width=22)
         menu.pack(anchor='w')
         menu.bind('<<ComboboxSelected>>', self._on_scale)
         style = ttk.Style()
@@ -1184,13 +1232,13 @@ class AmbientApp:
         f.pack(fill='x', pady=(0, 6))
 
         layers_cfg = [
-            ('drone',   'DRONE',   'Ch.1', 45, 0.20, 0.00),
-            ('melody',  'MELODY',  'Ch.2', 38, 0.30, 0.35),
-            ('sparkle', 'SPARKLE', 'Ch.3', 28, 0.60, 0.60),
+            ('drone',   'DRONE',   'Ch.1', 0, 45, 0.20, 0.00),
+            ('melody',  'MELODY',  'Ch.2', 1, 38, 0.30, 0.35),
+            ('sparkle', 'SPARKLE', 'Ch.3', 2, 28, 0.60, 0.60),
         ]
         self._layer_vars = {}
 
-        for key, label, ch_label, def_vel, def_var, def_rest in layers_cfg:
+        for key, label, ch_label, midi_ch, def_vel, def_var, def_rest in layers_cfg:
             BG = '#141428'
             block = tk.Frame(f, bg=BG, padx=10, pady=8)
             block.pack(fill='x', pady=3)
@@ -1205,6 +1253,11 @@ class AmbientApp:
             _pb.pack(side='left')
             tk.Label(header, text=ch_label, bg=BG, fg=C_MUTED,
                      font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+            # シグナルランプ
+            lamp = tk.Label(header, text='●', bg=BG, fg='#2a2a4a',
+                            font=('Helvetica', 10))
+            lamp.pack(side='left', padx=(5, 0))
+            _lamp_fns[midi_ch] = lambda on, w=lamp: w.config(fg='#00c896' if on else '#2a2a4a')
 
             # ノブ3つ横並び
             knob_row = tk.Frame(block, bg=BG)
@@ -1222,6 +1275,22 @@ class AmbientApp:
                                      C_REST, BG, lambda v, k=key: self._on_rest(k, v))
             krest.master.pack(side='left', padx=10)
 
+            # Drone のみオクターブ選択を追加
+            if key == 'drone':
+                oct_row = tk.Frame(block, bg=BG)
+                oct_row.pack(fill='x', pady=(6, 0))
+                tk.Label(oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._drone_oct_btns = {}
+                for ov in [1, 2, 3, 4, 5]:
+                    btn = tk.Label(oct_row, text=str(ov), width=3,
+                                   bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                   font=('Helvetica', 9), pady=3, cursor='hand2')
+                    btn.bind('<Button-1>', lambda e, v=ov: self._on_drone_octave(v))
+                    btn.pack(side='left', padx=1)
+                    self._drone_oct_btns[ov] = btn
+                self._update_drone_oct_buttons(3)
+
         # ---- CHORD ブロック ----
         C_CHORD = '#7ecfe0'
         BG = '#141428'
@@ -1237,6 +1306,11 @@ class AmbientApp:
         _pb.pack(side='left')
         tk.Label(header, text='Ch.4', bg=BG, fg=C_MUTED,
                  font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+        # シグナルランプ (Ch.4 = MIDI ch 3)
+        chord_lamp = tk.Label(header, text='●', bg=BG, fg='#2a2a4a',
+                              font=('Helvetica', 10))
+        chord_lamp.pack(side='left', padx=(5, 0))
+        _lamp_fns[3] = lambda on, w=chord_lamp: w.config(fg='#00c896' if on else '#2a2a4a')
 
         # ARP ON/OFF + モード選択
         arp_row = tk.Frame(block, bg=BG)
@@ -1525,6 +1599,20 @@ class AmbientApp:
                 self._arp_rand_btn.config(bg='#1e1e38', fg='#4a9eff',
                                           font=('Helvetica', 8, 'bold'))
 
+    def _on_drone_octave(self, val):
+        with STATE._lock: STATE.drone_octave = val
+        self._update_drone_oct_buttons(val)
+
+    def _update_drone_oct_buttons(self, selected):
+        colors = {1: '#a9e4ff', 2: '#4dabf7', 3: '#69db7c', 4: '#ffa94d', 5: '#ff6b6b'}
+        for ov, btn in self._drone_oct_btns.items():
+            if ov == selected:
+                btn.config(bg=colors.get(ov, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 9, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff',
+                           font=('Helvetica', 9))
+
     def _on_chord_octave(self):
         with STATE._lock: STATE.chord_octave = self._chord_oct_var.get()
 
@@ -1697,6 +1785,11 @@ class AmbientApp:
         global _midi_muted
         _midi_muted = True          # まずノートオンを即ブロック
         midi_panic()                # 今鳴っている音を即消音
+        # シグナルランプを全消灯
+        for c in range(4):
+            _lamp_notes[c] = 0
+            if c in _lamp_fns:
+                _lamp_fns[c](False)
         self._playing = False
         self._play_btn.config(text='  ▶  START  ', bg=C_ON,
                                activebackground='#00a87d')
