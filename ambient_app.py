@@ -2417,11 +2417,38 @@ class AmbientApp:
         self._evolve_btn.pack(fill='x', pady=(0, 6))
         self._evolve_btn.bind('<Button-1>', lambda e: self._on_evolve_toggle())
 
-        # XY パッド（Kaoss Pad）
+        # XY パッド + Mod Wheel（横並び）
         pad_outer = tk.Frame(f, bg=C_BG)
         pad_outer.pack()
+
+        # ── Mod Wheel（左） ──────────────────────────────────────
+        mod_col = tk.Frame(pad_outer, bg=C_BG)
+        mod_col.pack(side='left', padx=(0, 6))
+        tk.Label(mod_col, text='MOD', bg=C_BG, fg='#6677aa',
+                 font=('Helvetica', 7, 'bold')).pack(pady=(0, 2))
+        self._mod_wheel_var = tk.IntVar(value=0)
+        self._mod_wheel = tk.Scale(
+            mod_col,
+            from_=127, to=0,
+            variable=self._mod_wheel_var,
+            orient='vertical',
+            length=KaossPad.H,
+            width=22,
+            showvalue=False,
+            bg='#111128', fg='#6677aa',
+            troughcolor='#0a0a1e',
+            activebackground='#7c8fdd',
+            highlightthickness=1,
+            highlightbackground='#2a2a4a',
+            command=self._on_mod_wheel)
+        self._mod_wheel.pack()
+        self._mod_val_lbl = tk.Label(mod_col, text='0', bg=C_BG, fg='#445566',
+                                     font=('Helvetica', 7))
+        self._mod_val_lbl.pack(pady=(2, 0))
+
+        # ── KaossPad（右） ───────────────────────────────────────
         self._kaoss_pad = KaossPad(pad_outer, command=self._on_kaoss)
-        self._kaoss_pad.pack()
+        self._kaoss_pad.pack(side='left')
 
         # Auto Mod モードボタン行
         mode_row = tk.Frame(f, bg=C_BG)
@@ -3522,6 +3549,19 @@ class AmbientApp:
         with STATE._lock:
             STATE.evolve_speed = x
             STATE.evolve_depth = y
+
+    def _on_mod_wheel(self, val):
+        v = int(val)
+        # 表示を更新
+        if hasattr(self, '_mod_val_lbl'):
+            self._mod_val_lbl.config(text=str(v))
+        # CC#1 を全チャンネル（0-3）へ送信
+        try:
+            midi = get_midi()
+            for ch in range(4):
+                midi.send_message([0xB0 | ch, 1, v])
+        except Exception:
+            pass
 
     def _on_auto_mod_toggle(self):
         v = not self._auto_mod_var.get()
