@@ -10,10 +10,63 @@ import rtmidi
 import time
 import random
 import math
+import sys
 
 # ================================================================
 # スケール定義
 # ================================================================
+# ================================================================
+# メロディ リズムフィギュア（beats単位、speed倍率前）
+# ================================================================
+MELODY_RHYTHM_PATTERNS = {
+    # Free: 従来のランダム per-note（None = 既存ロジック）
+    'free': None,
+    # Flowing: なめらかな流れ、スラーっぽい
+    'flowing': [
+        [2.0, 1.0, 1.0, 2.0],
+        [1.0, 1.0, 2.0, 2.0],
+        [2.0, 2.0, 1.0, 1.0],
+        [1.0, 2.0, 1.0, 2.0],
+        [2.0, 1.0, 2.0, 1.0],
+        [4.0, 2.0, 2.0],
+    ],
+    # Dotted: 付点リズム、跳ねる感覚
+    'dotted': [
+        [1.5, 0.5, 1.5, 0.5, 2.0],
+        [3.0, 1.0, 2.0],
+        [0.5, 1.5, 0.5, 1.5, 2.0],
+        [1.5, 0.5, 2.0, 2.0],
+        [0.5, 1.5, 2.0, 1.0, 1.0],
+        [3.0, 0.5, 0.5, 2.0],
+    ],
+    # Synco: シンコペーション、オフビートの緊張
+    'synco': [
+        [0.5, 1.5, 1.0, 1.0, 2.0],
+        [1.0, 0.5, 0.5, 2.0, 2.0],
+        [1.5, 0.5, 1.5, 0.5, 2.0],
+        [0.5, 0.5, 1.0, 1.0, 3.0],
+        [1.0, 1.5, 0.5, 1.0, 2.0],
+        [0.5, 1.0, 1.5, 1.0, 2.0],
+    ],
+    # Staccato: 細かい音符の連続、パッセージ感
+    'staccato': [
+        [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1.5],
+        [1.0, 0.5, 0.5, 1.0, 1.0, 2.0],
+        [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 2.0],
+        [0.5, 0.5, 1.0, 0.5, 0.5, 3.0],
+        [0.5, 0.5, 0.5, 1.5, 1.0, 2.0],
+    ],
+    # Breath: 長い音とスペース、ゆったり
+    'breath': [
+        [4.0, 4.0],
+        [6.0, 2.0],
+        [3.0, 1.0, 4.0],
+        [4.0, 2.0, 2.0],
+        [8.0],
+        [2.0, 6.0],
+    ],
+}
+
 SCALES = {
     # ── 明るい系 ──────────────────────────────
     'Major':             [0, 2, 4, 5, 7, 9, 11],
@@ -98,19 +151,22 @@ class GlobalState:
         self.bpm        = 52
         self.density    = 'normal'
         self.dynamic    = 1.0
-        self.auto_evolve = True
+        self.auto_evolve = False
         self.layers     = {'drone': True, 'melody': True, 'sparkle': True, 'chord': True}
         self.vel        = {'drone': 45, 'melody': 38, 'sparkle': 28, 'chord': 55}
         self.drone_octave = 3  # ドローン絶対オクターブ (1〜5)、ルートと独立
         # 変化量 0.0〜1.0 : 低=ステップワイズ、高=大跳躍多め
-        self.variation  = {'drone': 0.2,   'melody': 0.3,   'sparkle': 0.6,   'chord': 0.3}
+        self.variation        = {'drone': 0.2,   'melody': 0.3,   'sparkle': 0.6,   'chord': 0.3}
+        self.variation_random = {'drone': False,  'melody': False,  'sparkle': False,  'chord': False}
         # 休符率 0.0〜1.0
         self.rest_prob    = {'drone': 0.0,   'melody': 0.35,  'sparkle': 0.60,  'chord': 0.20}
         # アルペジエーター
         self.arp_on          = True
         self.arp_mode        = 'up'    # 'up' / 'down' / 'zigzag' / 'random'
-        self.arp_rate        = 0.25   # beats/step (BPM同期ノート値)
-        self.arp_rate_random = False  # Trueのとき毎サイクルランダム選択
+        self.arp_rate          = 0.25   # beats/step (BPM同期ノート値)
+        self.arp_rate_random   = False  # Trueのとき毎サイクルランダム選択
+        self.arp_rate_rand_min = 0.125  # ランダム範囲 下限
+        self.arp_rate_rand_max = 4.0    # ランダム範囲 上限
         self.chord_octave    = 1      # ベースオクターブオフセット (+1〜+3)
         self.chord_oct_range  = 1      # 何オクターブ分アルペジオを広げるか (1〜3)
         self.chord_degree  = 0           # Ⅰ (semitone offset)
@@ -127,6 +183,10 @@ class GlobalState:
         self.melody_speed_random  = False  # Trueのとき自動ランダム切り替え
         self.melody_speed_rand_min = 0.25  # ランダム範囲 下限
         self.melody_speed_rand_max = 4.0   # ランダム範囲 上限
+        self.melody_octave        = 1      # 基準オクターブ (1〜5)
+        self.melody_range         = 1      # 音域レンジ（オクターブ数 1〜3）
+        self.melody_character     = []     # 'contour','phrase','motif' の組み合わせ
+        self.melody_rhythm        = 'free' # リズムスタイル
         # 全パラメーター自動ランダム切り替え
         self.arp_auto      = False
         self.arp_auto_bars = 4        # 何小節ごとに切り替えるか
@@ -135,11 +195,18 @@ class GlobalState:
         # 展開の速さ 0.0〜1.0 (変化の頻度)
         self.evolve_speed = 0.5
         # ルートのランダム自動変化
-        self.auto_root      = False
-        self.auto_root_bars = 16     # 変化する小節数
+        self.auto_root          = False
+        self.auto_root_bars     = 16    # 現在の変化小節数
+        self.auto_root_bars_min = 1     # 小節数ランダム範囲 下限
+        self.auto_root_bars_max = 64    # 小節数ランダム範囲 上限
+        self.auto_root_pool     = list(range(12))  # ランダム範囲：ピッチクラス 0〜11
+        self.drone_follow       = 'root'           # ドローン追従先: 'root' or 'chord'
         # スケールのランダム自動変化
         self.auto_scale      = False
         self.auto_scale_bars = 16
+        # コード自動変化 小節数ランダム範囲
+        self.chord_auto_bars_min = 2
+        self.chord_auto_bars_max = 16
 
     def get(self):
         with self._lock:
@@ -151,20 +218,29 @@ class GlobalState:
                 dynamic       = self.dynamic,
                 layers        = dict(self.layers),
                 vel           = dict(self.vel),
-                variation     = dict(self.variation),
+                variation        = dict(self.variation),
+                variation_random = dict(self.variation_random),
                 rest_prob     = dict(self.rest_prob),
                 auto_evolve      = self.auto_evolve,
                 drone_octave     = self.drone_octave,
                 evolve_depth     = self.evolve_depth,
                 evolve_speed     = self.evolve_speed,
-                auto_root       = self.auto_root,
-                auto_root_bars  = self.auto_root_bars,
+                auto_root           = self.auto_root,
+                auto_root_bars      = self.auto_root_bars,
+                auto_root_bars_min  = self.auto_root_bars_min,
+                auto_root_bars_max  = self.auto_root_bars_max,
+                auto_root_pool      = list(self.auto_root_pool),
+                drone_follow        = self.drone_follow,
+                chord_auto_bars_min = self.chord_auto_bars_min,
+                chord_auto_bars_max = self.chord_auto_bars_max,
                 auto_scale      = self.auto_scale,
                 auto_scale_bars = self.auto_scale_bars,
                 arp_on          = self.arp_on,
                 arp_mode        = self.arp_mode,
-                arp_rate        = self.arp_rate,
-                arp_rate_random = self.arp_rate_random,
+                arp_rate          = self.arp_rate,
+                arp_rate_random   = self.arp_rate_random,
+                arp_rate_rand_min = self.arp_rate_rand_min,
+                arp_rate_rand_max = self.arp_rate_rand_max,
                 chord_octave    = self.chord_octave,
                 chord_oct_range = self.chord_oct_range,
                 chord_degree  = self.chord_degree,
@@ -182,6 +258,10 @@ class GlobalState:
                 melody_speed_random    = self.melody_speed_random,
                 melody_speed_rand_min  = self.melody_speed_rand_min,
                 melody_speed_rand_max  = self.melody_speed_rand_max,
+                melody_octave          = self.melody_octave,
+                melody_range           = self.melody_range,
+                melody_character       = list(self.melody_character),
+                melody_rhythm         = self.melody_rhythm,
             )
 
 STATE = GlobalState()
@@ -206,6 +286,16 @@ def build_matrix(n, variation=0.3):
             row.append(blended[d])
         s = sum(row)
         m.append([w / s for w in row])
+    return m
+
+def apply_chord_boost(matrix, notes, chord_tone_pcs, boost=2.5):
+    """コードトーン列を boost 倍してから行ごとに正規化"""
+    m = []
+    for row in matrix:
+        new_row = [w * (boost if notes[j] % 12 in chord_tone_pcs else 1.0)
+                   for j, w in enumerate(row)]
+        s = sum(new_row)
+        m.append([w / s for w in new_row])
     return m
 
 def next_deg(cur, mat):
@@ -415,60 +505,87 @@ def midi_panic():
 # ================================================================
 class DroneLayer:
     def __init__(self, log_fn):
-        self.log      = log_fn
-        self.ch       = 0
-        self._running = False
-        self._active  = []
+        self.log          = log_fn
+        self.ch           = 0
+        self._running     = False
+        self._active      = []          # 現在鳴らしているノート
+        self._pending_off = []          # [(notes, off_at)] 旧ノートの遅延off
+
+    def _compute_root(self, s):
+        if s['drone_follow'] == 'chord':
+            root_pc = (s['root'] % 12 + s['chord_degree']) % 12
+        else:
+            root_pc = s['root'] % 12
+        root = root_pc + s['drone_octave'] * 12
+        return max(0, min(115, root))
+
+    def _flush_pending(self, force=False):
+        """期限切れ（またはforce時は全）の旧ノートをnote-offする"""
+        now = time.perf_counter()
+        remaining = []
+        for notes, off_at in self._pending_off:
+            if force or now >= off_at:
+                for n in notes:
+                    midi_off(self.ch, n)
+            else:
+                remaining.append((notes, off_at))
+        self._pending_off = remaining
+
+    def _stop_all(self):
+        self._flush_pending(force=True)
+        for n in self._active:
+            midi_off(self.ch, n)
+        self._active = []
 
     def _loop(self):
         last_root = None
         while self._running:
             s = STATE.get()
             if not s['layers']['drone']:
-                midi_all_off(self.ch)
+                self._stop_all()
                 last_root = None
                 time.sleep(0.2)
                 continue
+
             beat = 60.0 / s['bpm']
-            # ルートの音名（ピッチクラス）のみ使用 → ドローン独自のオクターブを適用
-            root = (s['root'] % 12) + s['drone_octave'] * 12
-            root = max(0, min(115, root))
+            root = self._compute_root(s)
             var  = s['variation']['drone']
 
+            # ルートが変化 or 初回: 旧ノートは4拍後にoff、新ノートを即開始
             if root != last_root:
-                midi_all_off(self.ch)
+                if self._active:
+                    off_at = time.perf_counter() + 10 * beat
+                    self._pending_off.append((list(self._active), off_at))
+                    self._active = []
                 last_root = root
 
-            midi_all_off(self.ch)
+                base_notes = [root, root + 7]
+                if var > 0.5 and random.random() < var - 0.3:
+                    extra = random.choice([3, 4, 10, 12])
+                    base_notes.append(root + extra)
 
-            base_notes = [root, root + 7]
-            if var > 0.5 and random.random() < var - 0.3:
-                extra = random.choice([3, 4, 10, 12])
-                base_notes.append(root + extra)
+                if not self._running:
+                    break
 
-            if not self._running:
-                break
+                vel = int(s['vel']['drone'] * s['dynamic'])
+                self._active = base_notes[:]
+                for n in base_notes:
+                    if 0 <= n <= 127:
+                        midi_on(self.ch, n, vel)
+                names = [NOTE_NAMES[n % 12] for n in base_notes]
+                self.log(f"Drone   {names}  vel={vel}  var={int(var*100)}%")
 
-            vel = int(s['vel']['drone'] * s['dynamic'])
-            self._active = base_notes[:]
-            for n in base_notes:
-                if 0 <= n <= 127:
-                    midi_on(self.ch, n, vel)
-
-            names = [NOTE_NAMES[n % 12] for n in base_notes]
-            self.log(f"Drone   {names}  vel={vel}  var={int(var*100)}%")
-
-            base_dur = 16
-            if var > 0.4:
-                base_dur = int(base_dur * (1.0 - var * 0.5))
-                base_dur = max(4, base_dur)
-
-            # 0.1秒刻みで待機 → STOPで即座に抜けられる
-            elapsed = 0.0
-            total = base_dur * beat
-            while self._running and elapsed < total:
+            # 0.1秒刻みでポーリング：期限切れpendingをoff、ルート変化を検知
+            while self._running:
                 time.sleep(0.1)
-                elapsed += 0.1
+                self._flush_pending()
+                s2    = STATE.get()
+                new_r = self._compute_root(s2)
+                if new_r != last_root:
+                    break
+                # レイヤーOFF
+                if not s2['layers']['drone']:
+                    break
 
     def start(self):
         self._running = True
@@ -476,7 +593,7 @@ class DroneLayer:
 
     def stop(self):
         self._running = False
-        midi_all_off(self.ch)
+        self._stop_all()
 
 
 class MelodyLayer:
@@ -487,27 +604,186 @@ class MelodyLayer:
     }
 
     def __init__(self, ch, octave, layer_key, gate, label, log_fn):
-        self.ch         = ch
-        self.octave     = octave
-        self.layer_key  = layer_key
-        self.gate       = gate
-        self.label      = label
-        self.log        = log_fn
-        self._running   = False
-        self._deg       = 0
-        self._cur_scale = None
-        self._cur_var   = None
-        self._matrix    = None
-        self._notes     = []
+        self.ch          = ch
+        self.octave      = octave      # sparkle など固定オクターブ用
+        self.layer_key   = layer_key
+        self.gate        = gate
+        self.label       = label
+        self.log         = log_fn
+        self._running    = False
+        self._deg              = 0
+        self._cur_scale        = None
+        self._cur_var          = None
+        self._cur_root         = None
+        self._cur_oct          = None
+        self._cur_range        = None
+        self._cur_chord_degree = None
+        self._cur_chord_qual   = None
+        self._chord_tone_idxs  = []   # self._notes 内のコードトーン index
+        self._matrix           = None
+        self._notes            = []
+        # キャラクター A: コンター重力
+        self._contour_bias     = 0.0   # -1.0(下降中) 〜 +1.0(上昇中)
+        # キャラクター B: フレーズビルダー
+        self._phrase_target    = None  # ターゲット index
+        self._phrase_len       = 6
+        self._phrase_pos       = 0
+        # キャラクター C: モチーフ
+        self._motif            = []    # 相対ステップのリスト
+        self._motif_pos        = 0
+        self._motif_count      = 0
+        self._motif_max        = 3
+        # リズムフィギュア
+        self._rhythm_pattern   = []
+        self._rhythm_pos       = 0
 
-    def _rebuild(self, root, scale_name, variation):
+    def _rebuild(self, root, scale_name, variation, base_oct, n_range,
+                 chord_degree, chord_quality):
         ivs = SCALES[scale_name]
-        self._notes = [root + self.octave * 12 + iv for iv in ivs
-                       if 0 <= root + self.octave * 12 + iv <= 127]
-        self._matrix    = build_matrix(len(ivs), variation)
-        self._deg       = min(self._deg, max(0, len(ivs) - 1))
-        self._cur_scale = scale_name
-        self._cur_var   = variation
+        notes = []
+        for oct_offset in range(n_range):
+            for iv in ivs:
+                n = root + (base_oct + oct_offset) * 12 + iv
+                if 0 <= n <= 127:
+                    notes.append(n)
+        self._notes = sorted(set(notes))
+        # 行列は self._notes の実サイズで作る（n_range > 1 でも正しく動作）
+        base_mat = build_matrix(len(self._notes), variation)
+        # コードトーン（ピッチクラス）を計算してブースト
+        chord_root_pc  = (root % 12 + chord_degree) % 12
+        chord_tone_pcs = {(chord_root_pc + iv) % 12 for iv in chord_quality}
+        self._matrix = apply_chord_boost(base_mat, self._notes, chord_tone_pcs)
+        # フレーズ終端スナップ用: コードトーンの index リスト
+        self._chord_tone_idxs  = [i for i, n in enumerate(self._notes)
+                                   if n % 12 in chord_tone_pcs]
+        self._deg              = min(self._deg, max(0, len(self._notes) - 1))
+        self._cur_scale        = scale_name
+        self._cur_var          = variation
+        self._cur_root         = root
+        self._cur_oct          = base_oct
+        self._cur_range        = n_range
+        self._cur_chord_degree = chord_degree
+        self._cur_chord_qual   = list(chord_quality)
+        # コード/スケール変化でモチーフ・フレーズをリセット
+        self._motif         = []
+        self._motif_pos     = 0
+        self._phrase_target = None
+        self._phrase_pos    = 0
+
+    def _get_rhythm_dur(self, style, density):
+        """リズムスタイルから次のデュレーション（beats）を返す"""
+        patterns = MELODY_RHYTHM_PATTERNS.get(style)
+        if not patterns:
+            return wchoice(self.DENSITY_DUR[density])
+        if not self._rhythm_pattern or self._rhythm_pos >= len(self._rhythm_pattern):
+            self._rhythm_pattern = random.choice(patterns)
+            self._rhythm_pos = 0
+        dur = self._rhythm_pattern[self._rhythm_pos]
+        self._rhythm_pos += 1
+        return dur
+
+    def _choose_next_deg(self, characters, dur_b):
+        """キャラクターに基づいて次の音度インデックスを返す"""
+        n = len(self._notes)
+        if n == 0: return 0
+
+        # self._deg の安全クランプ
+        self._deg = max(0, min(self._deg, n - 1))
+
+        # ---- キャラクター未選択: 既存ロジック ----
+        if not characters:
+            if dur_b >= 4.0 and self._chord_tone_idxs:
+                cur = self._notes[self._deg]
+                return min(self._chord_tone_idxs, key=lambda i: abs(self._notes[i] - cur))
+            deg = next_deg(self._deg, self._matrix)
+            return max(0, min(deg, n - 1))
+
+        # ---- ベース確率行 ----
+        row = list(self._matrix[self._deg]) if self._deg < len(self._matrix) \
+              else [1.0 / n] * n
+
+        # ---- Character B: Phrase Builder ----
+        if 'phrase' in characters:
+            if self._phrase_target is None and self._chord_tone_idxs:
+                self._phrase_target = random.choice(self._chord_tone_idxs)
+                self._phrase_len    = random.randint(4, 8)
+                self._phrase_pos    = 0
+            # フレーズ終端: ターゲットへスナップ
+            if self._phrase_pos >= self._phrase_len - 1:
+                result = self._phrase_target if self._phrase_target is not None else self._deg
+                self._phrase_pos    = 0
+                self._phrase_target = random.choice(self._chord_tone_idxs) \
+                                      if self._chord_tone_idxs else random.randint(0, n - 1)
+                self._phrase_len    = random.randint(4, 8)
+                if 'contour' in characters:
+                    if result > self._deg: self._contour_bias = min(1.0, self._contour_bias + 0.12)
+                    elif result < self._deg: self._contour_bias = max(-1.0, self._contour_bias - 0.12)
+                return result
+            # フレーズ中: ターゲット方向を強化
+            target    = self._phrase_target or self._deg
+            direction = 1 if target > self._deg else (-1 if target < self._deg else 0)
+            for j in range(n):
+                if direction > 0 and j > self._deg: row[j] *= 1.7
+                elif direction < 0 and j < self._deg: row[j] *= 1.7
+            self._phrase_pos += 1
+
+        # ---- Character A: Contour Gravity ----
+        if 'contour' in characters and abs(self._contour_bias) > 0.15:
+            strength = abs(self._contour_bias) * 2.5
+            for j in range(n):
+                if self._contour_bias > 0 and j < self._deg:
+                    row[j] *= (1.0 + strength)
+                elif self._contour_bias < 0 and j > self._deg:
+                    row[j] *= (1.0 + strength)
+
+        # ---- Character C: Motif ----
+        if 'motif' in characters:
+            if not self._motif:
+                cur = self._deg
+                self._motif = []
+                for _ in range(random.randint(3, 5)):
+                    nd = max(0, min(next_deg(cur, self._matrix), n - 1))
+                    self._motif.append(nd - cur)
+                    cur = nd
+                self._motif_pos   = 0
+                self._motif_count = 0
+                self._motif_max   = random.randint(2, 4)
+            if self._motif_pos < len(self._motif):
+                step = self._motif[self._motif_pos]
+                if self._motif_count > 0:
+                    step += random.choices([0, 0, 0, 1, -1], weights=[7, 7, 7, 1, 1])[0]
+                target_deg = max(0, min(n - 1, self._deg + step))
+                row[target_deg] *= 4.0
+                self._motif_pos += 1
+                if self._motif_pos >= len(self._motif):
+                    self._motif_pos = 0
+                    self._motif_count += 1
+                    if self._motif_count >= self._motif_max:
+                        self._motif = []
+
+        # ---- Character D: ChordOnly ----
+        if 'chord' in characters and self._chord_tone_idxs:
+            chord_set = set(self._chord_tone_idxs)
+            row = [w if j in chord_set else 0.0 for j, w in enumerate(row)]
+
+        # ---- 正規化してサンプリング ----
+        s = sum(row)
+        row = [w / s for w in row] if s > 0 else [1.0 / n] * n
+        r, c = random.random(), 0.0
+        result = n - 1
+        for i, w in enumerate(row):
+            c += w
+            if r < c:
+                result = i
+                break
+
+        # コンターバイアス更新
+        if 'contour' in characters:
+            if result > self._deg:   self._contour_bias = min(1.0,  self._contour_bias + 0.12)
+            elif result < self._deg: self._contour_bias = max(-1.0, self._contour_bias - 0.12)
+            else:                    self._contour_bias *= 0.85
+
+        return result
 
     def _loop(self):
         while self._running:
@@ -522,22 +798,57 @@ class MelodyLayer:
             var       = s['variation'][key]
             rest_prob = s['rest_prob'][key]
 
+            # melody レイヤーは STATE からオクターブ・レンジを取得、他は固定
+            if self.layer_key == 'melody':
+                base_oct = s['melody_octave']
+                n_range  = s['melody_range']
+            else:
+                base_oct = self.octave
+                n_range  = 1
+
+            chord_degree = s['chord_degree']
+            chord_qual   = s['chord_quality']
             if s['scale_name'] != self._cur_scale \
                     or abs(var - (self._cur_var or -1)) > 0.05 \
+                    or s['root'] != self._cur_root \
+                    or base_oct != self._cur_oct \
+                    or n_range != self._cur_range \
+                    or chord_degree != self._cur_chord_degree \
+                    or chord_qual   != self._cur_chord_qual \
                     or not self._notes:
-                self._rebuild(s['root'], s['scale_name'], var)
+                self._rebuild(s['root'], s['scale_name'], var, base_oct, n_range,
+                              chord_degree, chord_qual)
 
-            self._deg = next_deg(self._deg, self._matrix)
+            characters    = s.get('melody_character', [])
+            melody_rhythm = s.get('melody_rhythm', 'free')
+            if self.layer_key == 'melody' and melody_rhythm != 'free':
+                dur_b = self._get_rhythm_dur(melody_rhythm, s['density'])
+            else:
+                dur_b = wchoice(self.DENSITY_DUR[s['density']])
+            self._deg  = self._choose_next_deg(characters, dur_b)
             if self._deg >= len(self._notes):
                 self._deg = 0
 
             note  = self._notes[self._deg]
-            dur_b = wchoice(self.DENSITY_DUR[s['density']])
             beat  = 60.0 / STATE.bpm   # ノートごとに BPM 直読み → SLAVE追従
             # melody レイヤーのみ speed 倍率を適用
             speed = s['melody_speed'] if self.layer_key == 'melody' else 1.0
             dur_s = dur_b * beat * speed
             vel   = int((s['vel'][key] + random.randint(-15, 15)) * s['dynamic'])
+
+            # ---- Simple character: 小節頭に1音、残りは休符 ----
+            if 'simple' in characters and self.layer_key == 'melody':
+                one_beat = beat * speed
+                if random.random() < rest_prob:
+                    self._interruptible_sleep(4.0 * one_beat)
+                else:
+                    name = NOTE_NAMES[note % 12]
+                    self.log(f"{self.label}  {name}{note//12-1}  vel={vel}  [simple]")
+                    midi_on(self.ch, note, vel)
+                    self._interruptible_sleep(3.0 * one_beat)
+                    midi_off(self.ch, note)
+                    self._interruptible_sleep(one_beat)
+                continue
 
             if random.random() < rest_prob:
                 self._interruptible_sleep(dur_s)
@@ -573,11 +884,41 @@ class EvolutionController:
         self._phase   = 0.0
 
     def _loop(self):
-        t_mod        = time.time() + random.uniform(30, 60)
-        t_scale      = time.time() + random.uniform(45, 90)
-        t_dens       = time.time() + random.uniform(20, 50)
-        t_auto_root  = time.time() + 1.0
-        t_auto_scale = time.time() + 1.0
+        def _next(base, lo=0.6, hi=1.8):
+            return time.time() + random.uniform(base * lo, base * hi)
+
+        # 各変化のタイマーを分散して初期化
+        t_dynamic  = time.time()
+        t_mod      = _next(60)
+        t_scale    = _next(80)
+        t_dens     = _next(40)
+        t_chord    = _next(50)
+        t_arp      = _next(70)
+        t_rhythm   = _next(90)
+        t_bpm      = _next(120)
+        t_layer    = _next(100)
+
+        RELATED = {
+            'Major':             ['Lydian', 'Mixolydian', 'Pentatonic Major'],
+            'Lydian':            ['Major', 'Lydian Dominant', 'Pentatonic Major'],
+            'Lydian Dominant':   ['Lydian', 'Mixolydian', 'Whole Tone'],
+            'Mixolydian':        ['Major', 'Dorian', 'Lydian Dominant'],
+            'Pentatonic Major':  ['Major', 'Lydian', 'Mixolydian'],
+            'Minor':             ['Dorian', 'Harmonic Minor', 'Pentatonic Minor', 'Blues'],
+            'Dorian':            ['Minor', 'Phrygian', 'Melodic Minor'],
+            'Phrygian':          ['Minor', 'Phrygian Dominant', 'Locrian'],
+            'Locrian':           ['Phrygian', 'Diminished'],
+            'Harmonic Minor':    ['Minor', 'Phrygian Dominant', 'Hungarian Minor'],
+            'Melodic Minor':     ['Minor', 'Dorian', 'Lydian Dominant'],
+            'Pentatonic Minor':  ['Minor', 'Blues', 'Dorian', 'Hirajoshi'],
+            'Blues':             ['Pentatonic Minor', 'Minor', 'Dorian'],
+            'Phrygian Dominant': ['Phrygian', 'Harmonic Minor', 'Double Harmonic'],
+            'Hungarian Minor':   ['Harmonic Minor', 'Double Harmonic'],
+            'Double Harmonic':   ['Hungarian Minor', 'Phrygian Dominant'],
+            'Hirajoshi':         ['Pentatonic Minor', 'Phrygian'],
+            'Whole Tone':        ['Lydian Dominant', 'Diminished'],
+            'Diminished':        ['Whole Tone', 'Locrian', 'Phrygian'],
+        }
 
         while self._running:
             s   = STATE.get()
@@ -587,71 +928,103 @@ class EvolutionController:
                 depth = s['evolve_depth']   # 0.0〜1.0
                 spd   = s['evolve_speed']   # 0.0〜1.0
 
-                # ダイナミクス波: depthで振れ幅を制御
-                sin_speed = 0.002 + spd * 0.01
-                self._phase += sin_speed
-                swing = 0.15 + depth * 0.4
-                STATE.dynamic = max(0.2, min(1.0, 0.6 + swing * math.sin(self._phase)))
+                # インターバル基準: speed=0→90s、speed=1→5s
+                base = max(5, 90 - spd * 85)
 
-                # 転調インターバル: depthで幅を制御 (auto_root=Falseならスキップ)
+                # ① ダイナミクス波（毎ループ更新）
+                if now >= t_dynamic:
+                    sin_speed = 0.005 + spd * 0.03
+                    self._phase += sin_speed
+                    swing = 0.2 + depth * 0.65
+                    STATE.dynamic = max(0.1, min(1.0, 0.55 + swing * math.sin(self._phase)))
+                    t_dynamic = now + 0.1
+
+                # ② 転調: depth低=近音程、depth高=全セミトーン
                 if now >= t_mod:
-                    if s['auto_root']:
-                        if depth < 0.3:
-                            iv_pool = [-2, 2]
-                        elif depth < 0.7:
-                            iv_pool = [-5, -2, 2, 5]
-                        else:
-                            iv_pool = MODULATION_INTERVALS
-                        iv  = random.choice(iv_pool)
-                        new = max(36, min(60, s['root'] + iv))
-                        with STATE._lock: STATE.root = new
-                        self.log(f"[展開] 転調 → {NOTE_NAMES[new % 12]}{new//12-1}  (depth={int(depth*100)}%)")
-                    interval = 90 - spd * 75
-                    t_mod = now + random.uniform(interval * 0.6, interval * 1.4)
-
-                # スケール切り替え: depthが低いと関連スケールのみ
-                if now >= t_scale:
-                    RELATED = {
-                        'Major':             ['Lydian', 'Mixolydian', 'Pentatonic Major'],
-                        'Lydian':            ['Major', 'Lydian Dominant', 'Pentatonic Major'],
-                        'Lydian Dominant':   ['Lydian', 'Mixolydian', 'Whole Tone'],
-                        'Mixolydian':        ['Major', 'Dorian', 'Lydian Dominant'],
-                        'Pentatonic Major':  ['Major', 'Lydian', 'Mixolydian'],
-                        'Minor':             ['Dorian', 'Harmonic Minor', 'Pentatonic Minor', 'Blues'],
-                        'Dorian':            ['Minor', 'Phrygian', 'Melodic Minor'],
-                        'Phrygian':          ['Minor', 'Phrygian Dominant', 'Locrian'],
-                        'Locrian':           ['Phrygian', 'Diminished'],
-                        'Harmonic Minor':    ['Minor', 'Phrygian Dominant', 'Hungarian Minor'],
-                        'Melodic Minor':     ['Minor', 'Dorian', 'Lydian Dominant'],
-                        'Pentatonic Minor':  ['Minor', 'Blues', 'Dorian', 'Hirajoshi'],
-                        'Blues':             ['Pentatonic Minor', 'Minor', 'Dorian'],
-                        'Phrygian Dominant': ['Phrygian', 'Harmonic Minor', 'Double Harmonic'],
-                        'Hungarian Minor':   ['Harmonic Minor', 'Double Harmonic'],
-                        'Double Harmonic':   ['Hungarian Minor', 'Phrygian Dominant'],
-                        'Hirajoshi':         ['Pentatonic Minor', 'Phrygian'],
-                        'Whole Tone':        ['Lydian Dominant', 'Diminished'],
-                        'Diminished':        ['Whole Tone', 'Locrian', 'Phrygian'],
-                    }
-                    cur = s['scale_name']
-                    if depth < 0.5:
-                        opts = RELATED.get(cur, list(SCALES.keys()))
+                    if depth < 0.35:
+                        iv_pool = [-2, 2, -5, 5]
+                    elif depth < 0.65:
+                        iv_pool = [-7, -5, -2, 2, 5, 7]
                     else:
-                        opts = [k for k in SCALES if k != cur]
-                    new = random.choice(opts)
-                    with STATE._lock: STATE.scale_name = new
-                    self.log(f"[展開] スケール → {new}  (depth={int(depth*100)}%)")
-                    interval = 120 - spd * 100  # speed=0→120s, speed=1→20s
-                    t_scale = now + random.uniform(interval * 0.6, interval * 1.4)
+                        iv_pool = list(range(-11, 12))
+                    iv  = random.choice(iv_pool)
+                    new = max(36, min(72, s['root'] + iv))
+                    with STATE._lock: STATE.root = new
+                    self.log(f"[EVOLVE] 転調 → {NOTE_NAMES[new % 12]}")
+                    t_mod = _next(base * 1.2)
 
-                # 密度変化
-                if now >= t_dens:
-                    opts = [d for d in ['sparse', 'normal', 'dense'] if d != s['density']]
+                # ③ スケール: depth低=関連のみ、depth高=全スケール
+                if now >= t_scale:
+                    cur  = s['scale_name']
+                    opts = RELATED.get(cur, list(SCALES.keys())) if depth < 0.5 \
+                           else [k for k in SCALES if k != cur]
                     new  = random.choice(opts)
-                    with STATE._lock: STATE.density = new
-                    self.log(f"[展開] 密度 → {new}")
-                    interval = 60 - spd * 50   # speed=0→60s, speed=1→10s
-                    t_dens = now + random.uniform(interval * 0.6, interval * 1.4)
+                    with STATE._lock: STATE.scale_name = new
+                    self.log(f"[EVOLVE] スケール → {new}")
+                    t_scale = _next(base * 1.5)
 
+                # ④ 密度
+                if now >= t_dens:
+                    if depth < 0.4:
+                        opts = ['normal']  # 穏やか
+                    else:
+                        opts = [d for d in ['sparse', 'normal', 'dense'] if d != s['density']]
+                    with STATE._lock: STATE.density = random.choice(opts)
+                    self.log(f"[EVOLVE] 密度 → {STATE.density}")
+                    t_dens = _next(base * 0.7)
+
+                # ⑤ コード度数（depth > 0.3）
+                if depth > 0.3 and now >= t_chord:
+                    deg = random.choice(CHORD_DEGREES)
+                    with STATE._lock: STATE.chord_degree = deg[1]
+                    self.log(f"[EVOLVE] コード度数 → {deg[0]}")
+                    t_chord = _next(base)
+
+                # ⑥ アルペジオ モード + レート（depth > 0.4）
+                if depth > 0.4 and now >= t_arp:
+                    new_mode = random.choice(['up', 'down', 'zigzag', 'random'])
+                    if depth < 0.6:
+                        rate_pool = [0.25, 0.5, 1.0]
+                    else:
+                        rate_pool = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0]
+                    new_rate = random.choice(rate_pool)
+                    with STATE._lock:
+                        STATE.arp_mode = new_mode
+                        STATE.arp_rate = new_rate
+                    self.log(f"[EVOLVE] アルペジオ {new_mode} rate={new_rate}")
+                    t_arp = _next(base * 1.2)
+
+                # ⑦ メロディ リズムスタイル（depth > 0.45）
+                if depth > 0.45 and now >= t_rhythm:
+                    styles = list(MELODY_RHYTHM_PATTERNS.keys())
+                    new_r  = random.choice([r for r in styles if r != s['melody_rhythm']])
+                    with STATE._lock: STATE.melody_rhythm = new_r
+                    self.log(f"[EVOLVE] メロディリズム → {new_r}")
+                    t_rhythm = _next(base * 1.4)
+
+                # ⑧ BPM シフト（depth > 0.55）
+                if depth > 0.55 and now >= t_bpm:
+                    max_shift = int(depth * 50)
+                    shift = random.randint(-max_shift, max_shift)
+                    new_bpm = max(20, min(280, s['bpm'] + shift))
+                    with STATE._lock: STATE.bpm = new_bpm
+                    self.log(f"[EVOLVE] BPM → {new_bpm}")
+                    t_bpm = _next(base * 2.5)
+
+                # ⑨ レイヤー ON/OFF（depth > 0.65）
+                if depth > 0.65 and now >= t_layer:
+                    all_keys = ['drone', 'melody', 'sparkle', 'chord']
+                    k = random.choice(all_keys)
+                    with STATE._lock:
+                        cur_on = STATE.layers[k]
+                        # 最低2レイヤーは常時ON
+                        if cur_on and sum(STATE.layers.values()) > 2:
+                            STATE.layers[k] = False
+                            self.log(f"[EVOLVE] レイヤー {k.upper()} OFF")
+                        elif not cur_on:
+                            STATE.layers[k] = True
+                            self.log(f"[EVOLVE] レイヤー {k.upper()} ON")
+                    t_layer = _next(base * 2.0)
 
             time.sleep(0.1)
 
@@ -707,7 +1080,10 @@ class ChordLayer:
             arp_on    = s['arp_on']
             arp_mode  = s['arp_mode']
             if s['arp_rate_random']:
-                arp_rate = random.choice([0.125, 0.25, 0.5, 1.0, 2.0, 4.0])
+                _all_rates = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0]
+                lo, hi = s['arp_rate_rand_min'], s['arp_rate_rand_max']
+                pool = [v for v in _all_rates if lo - 0.001 <= v <= hi + 0.001]
+                arp_rate = random.choice(pool if pool else _all_rates)
             else:
                 arp_rate = s['arp_rate']
             rest_prob  = s['rest_prob']['chord']
@@ -862,6 +1238,639 @@ def section(parent, title):
     return frame
 
 # ================================================================
+# KaossPad ウィジェット（XY パッド）
+# ================================================================
+class KaossPad(tk.Canvas):
+    """
+    X 軸 = Speed (0.0〜1.0)、Y 軸 = Depth (0.0〜1.0, 上が高い)
+    ドラッグで値を変更し、command(x, y) を呼ぶ。
+    auto_mod_start() / auto_mod_stop() でドット自動移動。
+    """
+    W = 200
+    H = 160
+
+    def __init__(self, parent, bg=C_PANEL, command=None, **kw):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg='#0c0c1e', highlightthickness=1,
+                         highlightbackground='#2a2a4a', cursor='crosshair', **kw)
+        self._x    = 0.5   # 現在位置 Speed
+        self._y    = 0.5   # 現在位置 Depth
+        self._cmd  = command
+
+        # Auto Mod 用
+        self._am_active = False
+        self._am_tx     = random.random()
+        self._am_ty     = random.random()
+        self._am_speed  = 0.3
+        self._am_mode   = 'random'
+        self._am_phase  = 0.0
+        self._am_after  = None
+
+        # 衛星の向き・軌跡
+        self._sat_angle  = 0.0          # 進行方向角度（ラジアン）
+        self._sat_prev_x = self._x      # 前フレームの位置（angle 計算用）
+        self._sat_prev_y = self._y
+        self._sat_trail  = []           # [(cx, cy), ...] 最近の軌跡
+
+        # 衛星タイプ
+        self._sat_type      = 'sputnik1'
+        self._claude_frame  = 0         # 8bitアニメフレーム 0-3
+        self._claude_tick   = 0         # フレーム進行カウンタ
+
+        # 円運動用ランダムパラメータ
+        self._am_circle_r      = 0.25
+        self._am_circle_dir    = 1.0
+        self._am_circle_cx     = 0.5
+        self._am_circle_cy     = 0.5
+        self._am_circle_phase_r = 0.0  # 半径の緩やかな変動位相
+
+        # 八の字運動用ランダムパラメータ
+        self._am_f8_sx  = 0.40
+        self._am_f8_sy  = 0.35
+        self._am_f8_dir = 1.0
+        self._am_f8_cx  = 0.5
+        self._am_f8_cy  = 0.5
+
+        self._draw()
+        self.bind('<Button-1>',   self._on_click)
+        self.bind('<B1-Motion>',  self._on_drag)
+
+    # ── 描画 ──────────────────────────────────────────
+    def _draw(self):
+        self.delete('all')
+        W, H = self.W, self.H
+        cx = int(self._x * W)
+        cy = int((1.0 - self._y) * H)
+
+        # グリッド
+        for i in range(1, 4):
+            x = int(W * i / 4)
+            self.create_line(x, 0, x, H, fill='#1e1e38', width=1)
+        for i in range(1, 4):
+            y = int(H * i / 4)
+            self.create_line(0, y, W, y, fill='#1e1e38', width=1)
+
+        # カーソル位置から広がるグロー
+        r_outer = int(30 + self._y * 30)
+        for r, alpha in [(r_outer, '#111128'), (r_outer//2, '#1a2a4a'), (12, '#1e3a6a')]:
+            self.create_oval(cx-r, cy-r, cx+r, cy+r, fill=alpha, outline='')
+
+        # Auto Mod 目標点（薄く表示）
+        if self._am_active and self._am_mode == 'random':
+            tx = int(self._am_tx * W)
+            ty = int((1.0 - self._am_ty) * H)
+            self.create_oval(tx-4, ty-4, tx+4, ty+4,
+                             outline='#3a5a8a', fill='', width=1, dash=(2, 3))
+            self.create_line(cx, cy, tx, ty, fill='#1e2e4a', width=1, dash=(2, 4))
+
+        # 十字線
+        self.create_line(cx, 0, cx, H, fill='#2a3a6a', width=1, dash=(3, 4))
+        self.create_line(0, cy, W, cy, fill='#2a3a6a', width=1, dash=(3, 4))
+
+        # 軌跡
+        trail = self._sat_trail
+        for i, (tx, ty) in enumerate(trail):
+            t = (i + 1) / max(len(trail), 1)
+            r = max(1, int(t * 3))
+            c = int(20 + t * 60)
+            col = f'#{c:02x}{c:02x}{min(255, c+50):02x}'
+            self.create_oval(tx-r, ty-r, tx+r, ty+r, fill=col, outline='')
+
+        # 人工衛星
+        self._draw_satellite(cx, cy, self._sat_angle)
+
+        # 軸ラベル（四隅）
+        dim = '#3a3a6a'
+        self.create_text(4,     H-4,  text='CALM',    anchor='sw', fill=dim, font=('Helvetica', 7))
+        self.create_text(W-4,   H-4,  text='FAST',    anchor='se', fill=dim, font=('Helvetica', 7))
+        self.create_text(4,     4,    text='CHAOS',   anchor='nw', fill=C_EVO, font=('Helvetica', 7, 'bold'))
+        self.create_text(W-4,   4,    text='SPEED →', anchor='ne', fill=dim, font=('Helvetica', 7))
+        self.create_text(4,     H//2, text='↑ DEPTH', anchor='w',  fill=dim, font=('Helvetica', 7))
+
+        # 現在値（緑色で視認性アップ）
+        self.create_text(W//2, H-4,
+                         text=f'D:{int(self._y*100)}  S:{int(self._x*100)}',
+                         fill='#00c896', font=('Helvetica', 8, 'bold'))
+
+    # ── 操作 ──────────────────────────────────────────
+    def _on_click(self, e):
+        self._update(e.x, e.y)
+
+    def _on_drag(self, e):
+        self._update(e.x, e.y)
+
+    def _update_angle_and_trail(self):
+        """移動量から進行角度を更新し、軌跡を追記"""
+        W, H = self.W, self.H
+        dx = (self._x - self._sat_prev_x) * W
+        dy = -(self._y - self._sat_prev_y) * H  # 画面 y は反転
+        if abs(dx) > 0.3 or abs(dy) > 0.3:
+            self._sat_angle = math.atan2(dy, dx)
+        self._sat_prev_x = self._x
+        self._sat_prev_y = self._y
+        cx = int(self._x * W)
+        cy = int((1.0 - self._y) * H)
+        self._sat_trail.append((cx, cy))
+        if len(self._sat_trail) > 20:
+            self._sat_trail.pop(0)
+
+    def _update(self, px, py):
+        self._x = max(0.0, min(1.0, px / self.W))
+        self._y = max(0.0, min(1.0, 1.0 - py / self.H))
+        self._update_angle_and_trail()
+        self._draw()
+        if self._cmd:
+            self._cmd(self._x, self._y)
+
+    def _draw_satellite(self, cx, cy, angle):
+        """タイプに応じてポインタを描き分け"""
+        if self._sat_type == 'sputnik3':
+            self._draw_sputnik3(cx, cy, angle)
+        elif self._sat_type == 'hawk':
+            self._draw_hawk(cx, cy, angle)
+        elif self._sat_type == 'claude':
+            self._draw_claude(cx, cy, angle)
+        else:
+            self._draw_sputnik1(cx, cy, angle)
+
+    def set_sat_type(self, mode):
+        self._sat_type = mode
+        self._draw()
+
+    # ── ポインタ: スプートニク1号 ──────────────────────
+    def _draw_sputnik1(self, cx, cy, angle):
+        """スプートニク: 磨かれた金属球 + 前方付け根から後方へ流れる4本アンテナ"""
+        R     = 7
+        front = angle                # 進行方向（前）
+        back  = angle + math.pi      # 後方
+
+        # ── 球体ドロップシャドウ ────────────────────
+        self.create_oval(cx-R+1, cy-R+2, cx+R+1, cy+R+2,
+                         fill='#06060f', outline='')
+
+        # ── 球体本体（3層で立体感）──────────────────
+        self.create_oval(cx-R,   cy-R,   cx+R,   cy+R,
+                         fill='#8888a8', outline='#b0b0c8', width=1)
+        m = int(R * 0.72)
+        self.create_oval(cx-m,   cy-m,   cx+m,   cy+m,
+                         fill='#b8b8d0', outline='')
+        s = int(R * 0.42)
+        self.create_oval(cx-s,   cy-s,   cx+s,   cy+s,
+                         fill='#d4d4e8', outline='')
+
+        # ── 赤道縫い目（後方半円のみ）──────────────
+        perp = angle + math.pi / 2
+        pts  = []
+        for i in range(9):
+            t = perp + i * (math.pi / 8)
+            pts.append(cx + R * math.cos(t))
+            pts.append(cy + R * math.sin(t))
+        self.create_line(*pts, fill='#686888', width=1, smooth=False)
+
+        # ── スペキュラハイライト ─────────────────────
+        hx = cx - R * 0.38
+        hy = cy - R * 0.38
+        hr = max(2, int(R * 0.28))
+        self.create_oval(hx-hr, hy-hr, hx+hr, hy+hr,
+                         fill='#eeeeff', outline='')
+
+        # ── アンテナ（球体より後に描いて浮き出させる）──
+        antennas = [
+            (-0.62, -0.50, 15),
+            (-0.22, -0.17, 12),
+            ( 0.22,  0.17, 12),
+            ( 0.62,  0.50, 15),
+        ]
+        for da_r, da_t, length in antennas:
+            sx = cx + R * math.cos(front + da_r)
+            sy = cy + R * math.sin(front + da_r)
+            ex = cx + (R + length) * math.cos(back + da_t)
+            ey = cy + (R + length) * math.sin(back + da_t)
+            self.create_line(sx, sy, ex, ey, fill='#707090', width=2)
+            self.create_line(sx, sy, ex, ey, fill='#a8a8c8', width=1)
+            self.create_oval(ex-1.5, ey-1.5, ex+1.5, ey+1.5,
+                             fill='#c0c0d8', outline='')
+
+    # ── ポインタ: スプートニク3号 ─────────────────────
+    def _draw_sputnik3(self, cx, cy, angle):
+        """スプートニク3号: 長い円錐形ボディ + 後方に2本アンテナ"""
+        def r(px, py):
+            a = angle
+            return (cx + px*math.cos(a) - py*math.sin(a),
+                    cy + px*math.sin(a) + py*math.cos(a))
+
+        def poly(*pts_local):
+            return [c for pt in pts_local for c in r(*pt)]
+
+        # ── シャドウ ──────────────────────────────
+        sh = poly((13, 1), (-9, -10), (-13, -10), (-13, 10), (-9, 10))
+        self.create_polygon(sh, fill='#06060f', outline='')
+
+        # ── 本体（円錐形）──────────────────────────
+        body = poly((13, 0), (-9, -9), (-13, -9), (-13, 9), (-9, 9))
+        self.create_polygon(body, fill='#9898b8', outline='#b8b8d0', width=1)
+
+        # ハイライト帯（中央）
+        hi = poly((11, -1), (-7, -3), (-11, -3), (-11, 3), (-7, 3), (11, 1))
+        self.create_polygon(hi, fill='#c4c4d8', outline='')
+
+        # 内側ブライト
+        br = poly((9, -0.5), (-4, -1.8), (-7, -1.8), (-7, 1.8), (-4, 1.8), (9, 0.5))
+        self.create_polygon(br, fill='#dcdcec', outline='')
+
+        # ── ベースプレート ─────────────────────────
+        bp = poly((-9, -9), (-13, -9), (-13, 9), (-9, 9))
+        self.create_polygon(bp, fill='#6868a0', outline='#8888b8', width=1)
+
+        # ── アンテナ（後方コーナーから伸びる）──────
+        for ay in [-8, 8]:
+            ast = r(-12, ay * 0.9)
+            aen = r(-22, ay * 1.8)
+            self.create_line(ast[0], ast[1], aen[0], aen[1], fill='#6868a0', width=2)
+            self.create_line(ast[0], ast[1], aen[0], aen[1], fill='#a8a8c8', width=1)
+            self.create_oval(aen[0]-2, aen[1]-2, aen[0]+2, aen[1]+2,
+                             fill='#c0c0d8', outline='')
+
+        # ── 先端ハイライト ──────────────────────────
+        tip_h = r(9, -0.5)
+        self.create_oval(tip_h[0]-1.5, tip_h[1]-1.5, tip_h[0]+1.5, tip_h[1]+1.5,
+                         fill='#eeeeff', outline='')
+
+    # ── ポインタ: 鷹 ───────────────────────────────────
+    # ── ピクセルアート描画ヘルパー ─────────────────────
+    def _draw_pixel_art(self, cx, cy, angle, grid, colors, psize=2.0):
+        """グリッド定義のピクセルアートを回転して描画する"""
+        rows = len(grid)
+        cols = len(grid[0])
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        ox = cols * psize / 2.0   # グリッド中心のローカルx
+        oy = rows * psize / 2.0   # グリッド中心のローカルy
+
+        def rot(lx, ly):
+            return (cx + lx * cos_a - ly * sin_a,
+                    cy + lx * sin_a + ly * cos_a)
+
+        for ri, row in enumerate(grid):
+            for ci, ck in enumerate(row):
+                if not ck:
+                    continue
+                fill = colors.get(ck)
+                if not fill:
+                    continue
+                lx = ci * psize - ox
+                ly = ri * psize - oy
+                pts = [rot(lx, ly), rot(lx+psize, ly),
+                       rot(lx+psize, ly+psize), rot(lx, ly+psize)]
+                self.create_polygon([c for pt in pts for c in pt],
+                                    fill=fill, outline='')
+
+    # ── ポインタ: 鷹（8bitスタイル+羽ばたきアニメ）──
+    def _draw_hawk(self, cx, cy, angle):
+        """鷹 8bit: 上空俯瞰、ブロック状の形状、羽ばたき4フレーム"""
+        frame = self._claude_frame  # 0-3 で羽ばたき
+
+        def r(px, py):
+            a = angle
+            return (cx + px*math.cos(a) - py*math.sin(a),
+                    cy + px*math.sin(a) + py*math.cos(a))
+
+        def poly(*pts):
+            return [c for pt in pts for c in r(*pt)]
+
+        # 8bit 限定パレット
+        c_out  = '#080400'
+        c_dark = '#3a1e08'
+        c_wing = '#6a3810'
+        c_med  = '#8a5020'
+        c_lite = '#c07840'
+        c_belly= '#e8a858'
+        c_beak = '#e8a000'
+        c_eye  = '#f0e000'
+
+        # フレームごとの翼の開き具合: [全開, 中, 畳む, 中]
+        wspan = [18, 12, 5, 12][frame]       # 翼先端までのy幅
+        wback = [ 2,  6, 10,  6][frame]      # 翼先端のx後退量
+
+        # ── シャドウ ────────────────────────────
+        sh = poly((12,1),(4,-2),(-4,-3),(-10,-2),(-12,1),(-10,3),(-4,4),(4,3))
+        self.create_polygon(sh, fill='#06060f', outline='')
+
+        # ── 翼（左・右、8bitブロック形状）───────
+        for side in (-1, 1):   # -1=左, 1=右
+            ws = wspan * side
+            wb = wback
+            # 翼アウター
+            wo = poly(
+                ( 4,  3*side),
+                ( 4 - wb*0.3,  ws*0.55),
+                (-2 - wb,      ws),
+                (-6 - wb,      ws - 2*side),
+                (-5,           4*side),
+                ( 2,           3*side),
+            )
+            self.create_polygon(wo, fill=c_wing, outline=c_out, width=1)
+            # 翼インナー（明るめ帯）
+            wi = poly(
+                ( 3,  3*side),
+                ( 3 - wb*0.2,  ws*0.38),
+                (-1 - wb*0.65, ws*0.72),
+                (-3,           4*side),
+            )
+            self.create_polygon(wi, fill=c_med, outline='')
+            # 羽根ライン（3本、ドット状）
+            for t in [0.32, 0.60, 0.84]:
+                fx = 3 - (wb + 2) * t
+                fy = ws * t
+                fs = r(fx + 1.5, fy - 2.5*side)
+                fe = r(fx - 2.5, fy + 2.0*side)
+                self.create_line(fs[0],fs[1],fe[0],fe[1], fill=c_out, width=1)
+
+        # ── 尾羽（3枚ブロック）──────────────────
+        tc = poly((-9,-1),(-14,-2),(-15,0),(-14,2),(-9,1))
+        self.create_polygon(tc, fill=c_dark, outline=c_out, width=1)
+        tl = poly((-9,-2),(-12,-5),(-14,-3),(-11,-1))
+        self.create_polygon(tl, fill=c_med, outline=c_out, width=1)
+        tr = poly((-9, 2),(-12, 5),(-14, 3),(-11, 1))
+        self.create_polygon(tr, fill=c_med, outline=c_out, width=1)
+
+        # ── 胴体（8bitブロック矩形）─────────────
+        body = poly((11,0),(8,-3),(2,-4),(-7,-3),(-10,0),
+                    (-7,3),(2,4),(8,3))
+        self.create_polygon(body, fill=c_dark, outline=c_out, width=1)
+        belly = poly((7,0),(3,-2),(-2,-2),(-5,0),(-2,2),(3,2))
+        self.create_polygon(belly, fill=c_belly, outline='')
+        # ピクセルドット斑点
+        for dx, dy in [(3,1.5),(0,-1.5),(-3,1)]:
+            pt = r(dx, dy)
+            self.create_rectangle(pt[0]-1,pt[1]-1,pt[0]+1,pt[1]+1,
+                                  fill=c_dark, outline='')
+
+        # ── 頭部（四角ベース）───────────────────
+        h1=r(11,-3); h2=r(15,-3); h3=r(15,3); h4=r(11,3)
+        self.create_polygon([h1[0],h1[1],h2[0],h2[1],h3[0],h3[1],h4[0],h4[1]],
+                            fill=c_dark, outline=c_out, width=1)
+        # 目（四角ピクセル）
+        ey = r(13, -1.5)
+        self.create_rectangle(ey[0]-2, ey[1]-2, ey[0]+2, ey[1]+2, fill=c_eye, outline='')
+        pu = r(13.5, -1.5)
+        self.create_rectangle(pu[0]-1, pu[1]-1, pu[0]+1, pu[1]+1, fill=c_out, outline='')
+
+        # ── くちばし（8bitゴールド三角）─────────
+        bk = poly((15,-0.5),(20,0),(15,0.5))
+        self.create_polygon(bk, fill=c_beak, outline=c_out, width=1)
+
+    # ── ポインタ: Clawd（Claude公式ロゴ近似: 5枚ブレードピンホイール）──
+    def _draw_claude(self, cx, cy, angle):
+        """8-bitレトロロボット（進行方向に頭を向け、4フレームアニメ）
+        上空俯瞰: 前方(+x)=頭部, 後方(-x)=キャタピラ, ±y=左右"""
+
+        frame = self._claude_frame  # 0-3
+
+        def r(px, py):
+            a = angle
+            return (cx + px*math.cos(a) - py*math.sin(a),
+                    cy + px*math.sin(a) + py*math.cos(a))
+
+        def poly(*pts):
+            return [c for pt in pts for c in r(*pt)]
+
+        def px_rect(x0, y0, x1, y1):
+            """ピクセル風矩形ポリゴン"""
+            return poly((x0,y0),(x1,y0),(x1,y1),(x0,y1))
+
+        def px_dot(px_x, px_y, half=1.5, fill='#ffffff'):
+            """ピクセルドット（正方形）"""
+            pt = r(px_x, px_y)
+            self.create_rectangle(
+                pt[0]-half, pt[1]-half, pt[0]+half, pt[1]+half,
+                fill=fill, outline='')
+
+        # ── 8-bit レトロパレット ──────────────
+        C_STEEL  = '#8090A8'   # ロボット鋼鉄
+        C_LITE   = '#B8C8D8'   # ハイライト（明るい上面）
+        C_DARK   = '#181C28'   # アウトライン（ほぼ黒）
+        C_MED    = '#506070'   # 中間シャドウ
+        C_PANEL  = '#0A1E36'   # CRTパネル黒
+        C_VISOR  = '#102840'   # バイザー
+        C_GREEN  = '#00FF88'   # CRTグリーン目 (ON)
+        C_GREEND = '#005530'   # 目 暗(blink)
+        C_TRACK  = '#404858'   # キャタピラ
+        C_TGROOV = '#282E3A'   # キャタピラ溝
+        C_JOINT  = '#C8A840'   # 関節ボルト（ゴールド）
+        C_ANT_N  = '#FF6600'   # アンテナ（通常・橙）
+        C_ANT_B  = '#FFCC00'   # アンテナ（点灯・黄）
+        C_WARN   = '#FF2200'   # 警告ランプ
+        C_WARN_D = '#660800'   # 警告ランプ暗
+
+        # ── アニメーション変数 ────────────────
+        # キャタピラの溝を1フレームずつずらして回転感を出す
+        grv_off  = [0, 2, 4, 6][frame]          # 溝のx位置オフセット
+        eye_col  = C_GREEN  if frame != 2 else C_GREEND   # frame2=瞬き
+        ant_col  = C_ANT_B  if frame % 2 == 1  else C_ANT_N
+        warn_col = C_WARN   if frame in (1, 3)  else C_WARN_D
+
+        # ── シャドウ ─────────────────────────
+        sh = poly((11,1),(6,-5),(-8,-6),(-12,-3),(-13,0),
+                  (-12,3),(-8,6),(6,5))
+        self.create_polygon(sh, fill='#06060f', outline='')
+
+        # ══ キャタピラ（左右、後方）══════════
+        for side in (-1, 1):
+            # キャタピラ本体（長方形ブロック）
+            tr = px_rect(-12, side*4, 2, side*7)
+            self.create_polygon(tr, fill=C_TRACK, outline=C_DARK, width=1)
+            # 前輪・後輪（丸みのある四角）
+            for wx in (-11, 1):
+                wh = r(wx, side*5.5)
+                self.create_oval(wh[0]-2.5, wh[1]-2.5, wh[0]+2.5, wh[1]+2.5,
+                                 fill=C_MED, outline=C_DARK, width=1)
+            # 溝（アニメ: grv_off でずれる）
+            for gx_base in range(-10, 2, 4):
+                gx = gx_base + (grv_off % 4) - 2
+                if -12 <= gx <= 1:
+                    px_dot(gx, side*5.5, half=1.0, fill=C_TGROOV)
+
+        # ══ 胴体 ══════════════════════════════
+        # 胴体外殻
+        body = px_rect(-7, -4, 6, 4)
+        self.create_polygon(body, fill=C_STEEL, outline=C_DARK, width=1)
+        # 上面ハイライト
+        hi = px_rect(-6, -3, 5, 3)
+        self.create_polygon(hi, fill=C_LITE, outline='')
+
+        # チェストパネル（CRTスクリーン）
+        pan = px_rect(-4, -2.5, 2, 2.5)
+        self.create_polygon(pan, fill=C_PANEL, outline=C_DARK, width=1)
+        # パネル内のピクセルドット3×2
+        for dx, dy, col in [
+            (-3, -1.5, C_GREEN), (-1, -1.5, C_GREEN), (1, -1.5, C_GREEND),
+            (-3,  1.5, C_GREEND),(-1,  1.5, C_GREEN), (1,  1.5, C_GREEN ),
+        ]:
+            px_dot(dx, dy, half=0.9, fill=col if frame != 2 else C_GREEND)
+
+        # 警告ランプ（点滅）
+        px_dot(3.5, 0, half=1.5, fill=warn_col)
+
+        # ボルト（胴体四隅）
+        for bx, by in [(-6,-3.5),(-6,3.5),(5,-3.5),(5,3.5)]:
+            px_dot(bx, by, half=1.0, fill=C_JOINT)
+
+        # ── ショルダー（腕の付け根・張り出し）──
+        for side in (-1, 1):
+            sh_p = px_rect(-2, side*4, 4, side*6)
+            self.create_polygon(sh_p, fill=C_STEEL, outline=C_DARK, width=1)
+            px_dot(1, side*5, half=1.2, fill=C_JOINT)
+
+        # ══ 頭部 ══════════════════════════════
+        # 頭部外殻（角丸っぽく見せる3枚重ね）
+        head = px_rect(6, -4.5, 12, 4.5)
+        self.create_polygon(head, fill=C_STEEL, outline=C_DARK, width=1)
+        head_hi = px_rect(7, -3.5, 11, 3.5)
+        self.create_polygon(head_hi, fill=C_LITE, outline='')
+
+        # バイザー（目の部分の暗いスクリーン）
+        visor = px_rect(8, -2.8, 11.5, 2.8)
+        self.create_polygon(visor, fill=C_VISOR, outline=C_DARK, width=1)
+
+        # 目（2つのピクセル、縦並び）
+        for ey_y in (-1.5, 1.5):
+            px_dot(9.8, ey_y, half=1.8, fill=eye_col)
+            # 目の中央白点（瞳ハイライト）
+            if frame != 2:
+                px_dot(10.3, ey_y - 0.4, half=0.7, fill='#ffffff')
+
+        # 頭部ボルト
+        for bx, by in [(6.5,-4),(6.5,4),(11.5,-4),(11.5,4)]:
+            px_dot(bx, by, half=1.0, fill=C_JOINT)
+
+        # ── アンテナ ─────────────────────────
+        # 根本: 頭頂部
+        ant_b = r(9.5, -4.5)
+        ant_m = r(10.0, -7.5)
+        ant_t = r(10.5, -9.5)
+        self.create_line(ant_b[0],ant_b[1], ant_m[0],ant_m[1],
+                         fill=C_DARK, width=2)
+        self.create_line(ant_m[0],ant_m[1], ant_t[0],ant_t[1],
+                         fill=C_MED, width=1)
+        # 先端ビード（点滅）
+        self.create_oval(ant_t[0]-2.5, ant_t[1]-2.5, ant_t[0]+2.5, ant_t[1]+2.5,
+                         fill=ant_col, outline=C_DARK, width=1)
+        # 小ハイライト
+        self.create_oval(ant_t[0]-1.2, ant_t[1]-1.5, ant_t[0]+0.5, ant_t[1]-0.2,
+                         fill='#ffe8c0', outline='')
+
+    def set_pos(self, x, y):
+        self._x = max(0.0, min(1.0, float(x)))
+        self._y = max(0.0, min(1.0, float(y)))
+        self._draw()
+
+    # ── Auto Mod ──────────────────────────────────────
+    def auto_mod_start(self):
+        self._am_active = True
+        self._am_phase  = 0.0
+        self._am_tx = random.random()
+        self._am_ty = random.random()
+        self._tick()
+
+    def auto_mod_stop(self):
+        self._am_active = False
+        if self._am_after:
+            try:
+                self.after_cancel(self._am_after)
+            except Exception:
+                pass
+            self._am_after = None
+        self._draw()
+
+    def set_am_speed(self, v):
+        """v: 0.0〜1.0"""
+        self._am_speed = max(0.01, float(v))
+
+    def set_am_mode(self, mode):
+        """mode: 'random' / 'circle' / 'figure8' / 'spiral'"""
+        self._am_mode  = mode
+        self._am_phase = 0.0
+
+    def _tick(self):
+        if not self._am_active:
+            return
+
+        spd = self._am_speed
+        # 各モードの時間ステップ
+        dt = 0.015 + spd * 0.08
+
+        mode = self._am_mode
+
+        if mode == 'random':
+            # ランダム目標へのスムーズ補間
+            lerp = 0.02 + spd * 0.12
+            self._x += (self._am_tx - self._x) * lerp
+            self._y += (self._am_ty - self._y) * lerp
+            if math.hypot(self._am_tx - self._x, self._am_ty - self._y) < 0.03:
+                self._am_tx = random.random()
+                self._am_ty = random.random()
+
+        elif mode == 'circle':
+            # 方向・半径・中心をランダムに変化させる円運動
+            self._am_phase += dt * self._am_circle_dir
+            # 半径を緩やかに変動（0.08〜0.44 の間を正弦波でゆっくり変化）
+            self._am_circle_phase_r += dt * 0.25
+            r = 0.08 + 0.36 * (0.5 + 0.5 * math.sin(self._am_circle_phase_r))
+            self._am_circle_r = r
+            # ごく稀に中心をランダム移動
+            if random.random() < 0.003:
+                self._am_circle_cx = random.uniform(0.15, 0.85)
+                self._am_circle_cy = random.uniform(0.15, 0.85)
+            # ごく稀に回転方向を反転
+            if random.random() < 0.0015:
+                self._am_circle_dir *= -1
+            self._x = max(0.0, min(1.0, self._am_circle_cx + r * math.cos(self._am_phase)))
+            self._y = max(0.0, min(1.0, self._am_circle_cy + r * math.sin(self._am_phase)))
+
+        elif mode == 'figure8':
+            # 方向・スケール・中心をランダムに変化させる八の字（リサージュ曲線）
+            self._am_phase += dt * 0.8 * self._am_f8_dir
+            t = self._am_phase
+            # スケールをゆっくり変動
+            self._am_f8_sx = 0.20 + 0.22 * (0.5 + 0.5 * math.sin(t * 0.11))
+            self._am_f8_sy = 0.16 + 0.20 * (0.5 + 0.5 * math.cos(t * 0.09))
+            # ごく稀に中心をランダム移動
+            if random.random() < 0.003:
+                self._am_f8_cx = random.uniform(0.2, 0.8)
+                self._am_f8_cy = random.uniform(0.2, 0.8)
+            # ごく稀に方向反転
+            if random.random() < 0.0015:
+                self._am_f8_dir *= -1
+            self._x = max(0.0, min(1.0, self._am_f8_cx + self._am_f8_sx * math.sin(t)))
+            self._y = max(0.0, min(1.0, self._am_f8_cy + self._am_f8_sy * math.sin(2 * t)))
+
+        elif mode == 'spiral':
+            # 外向き螺旋 → リセット
+            self._am_phase += dt * 0.7
+            t = self._am_phase
+            # 8回転で外周まで広がり、リセット
+            period = 2 * math.pi * 6
+            frac   = (t % period) / period      # 0→1 で一周期
+            r      = frac * 0.47
+            self._x = max(0.0, min(1.0, 0.5 + r * math.cos(t * 5)))
+            self._y = max(0.0, min(1.0, 0.5 + r * math.sin(t * 5)))
+
+        # Claude アニメーションフレームを4tickごとに進める
+        self._claude_tick = (self._claude_tick + 1) % 4
+        if self._claude_tick == 0:
+            self._claude_frame = (self._claude_frame + 1) % 4
+
+        self._update_angle_and_trail()
+        self._draw()
+        if self._cmd:
+            self._cmd(self._x, self._y)
+
+        interval = max(16, int(50 - spd * 34))
+        self._am_after = self.after(interval, self._tick)
+
+
+# ================================================================
 # Knob ウィジェット
 # ================================================================
 class Knob(tk.Canvas):
@@ -960,6 +1969,7 @@ class Knob(tk.Canvas):
         self._draw()
         if self._cmd:
             self._cmd(self._val)
+        return 'break'  # ページスクロールに伝播させない
 
     def set(self, v):
         self._val = max(self.from_, min(self.to, float(v)))
@@ -1046,7 +2056,7 @@ class AmbientApp:
         self.root = tk.Tk()
         self.root.title('Ambient Generator')
         self.root.configure(bg=C_BG)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
 
         self._playing = False
         self._drone = self._melody = self._sparkle = self._evo = self._chord = None
@@ -1064,7 +2074,14 @@ class AmbientApp:
 
     # ---- UI構築 ----------------------------------------
     def _build_ui(self):
-        # タイトルバー
+        # ウィンドウ初期サイズ（スクロール可能にするため高さを固定）
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        win_h = min(760, sh - 80)
+        win_w = min(860, sw - 40)
+        self.root.geometry(f'{win_w}x{win_h}')
+
+        # タイトルバー（固定）
         title_bar = tk.Frame(self.root, bg=C_BG, pady=12)
         title_bar.pack(fill='x', padx=16)
         tk.Label(title_bar, text='AMBIENT GENERATOR',
@@ -1075,7 +2092,42 @@ class AmbientApp:
                                     font=('Helvetica', 9, 'bold'))
         self._status_lbl.pack(side='right')
 
-        cols = tk.Frame(self.root, bg=C_BG)
+        # ── スクロール可能エリア ──
+        scroll_frame = tk.Frame(self.root, bg=C_BG)
+        scroll_frame.pack(fill='both', expand=True)
+
+        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical')
+        scrollbar.pack(side='right', fill='y')
+
+        canvas = tk.Canvas(scroll_frame, bg=C_BG, highlightthickness=0,
+                           yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=canvas.yview)
+
+        inner = tk.Frame(canvas, bg=C_BG)
+        win_id = canvas.create_window(0, 0, anchor='nw', window=inner)
+
+        def _on_inner_configure(e):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        inner.bind('<Configure>', _on_inner_configure)
+
+        def _on_canvas_configure(e):
+            canvas.itemconfig(win_id, width=e.width)
+        canvas.bind('<Configure>', _on_canvas_configure)
+
+        canvas.configure(yscrollincrement=1)
+
+        def _page_scroll(e):
+            d = getattr(e, 'delta', 0)
+            if d != 0:
+                canvas.yview_scroll(int(-d * 4), 'units')
+
+        # Tk 8.6: bind_all でノブ以外の全ウィジェットからスクロール
+        self.root.bind_all('<MouseWheel>', _page_scroll)
+        self.root.bind_all('<Button-4>', lambda e: canvas.yview_scroll(-40, 'units'))
+        self.root.bind_all('<Button-5>', lambda e: canvas.yview_scroll( 40, 'units'))
+
+        cols = tk.Frame(inner, bg=C_BG)
         cols.pack(fill='both', padx=12, pady=4)
 
         left  = tk.Frame(cols, bg=C_BG)
@@ -1090,8 +2142,10 @@ class AmbientApp:
         self._build_density(left)
         self._build_layers(right)
         self._build_log(right)
+
         # テンポブリンク開始（UI構築後）
         self.root.after(100, self._bpm_blink_tick)
+
 
     def _build_transport(self, parent):
         f = section(parent, 'Transport')
@@ -1111,13 +2165,17 @@ class AmbientApp:
             command=self._on_bpm)
         self._bpm_knob.master.pack(side='right', padx=(12, 0))
 
-        # TAP テンポボタン（点滅でテンポ表示）
-        self._tap_btn = tk.Button(
-            row, text='TAP', command=self._on_tap,
-            bg='#1e1e38', fg='#aaaacc', relief='flat',
-            font=('Helvetica', 9, 'bold'), padx=8, pady=4,
-            activebackground='#00c896', cursor='hand2')
-        self._tap_btn.pack(side='right', padx=(0, 4))
+        # TAP テンポボタン（正方形・赤く点滅でテンポ表示）
+        self._tap_frame = tk.Frame(
+            row, width=28, height=28, bg='#1e1e38', cursor='hand2')
+        self._tap_frame.pack_propagate(False)
+        self._tap_frame.pack(side='right', padx=(0, 4))
+        self._tap_label = tk.Label(
+            self._tap_frame, text='TAP', bg='#1e1e38', fg='#aaaacc',
+            font=('Helvetica', 7, 'bold'), cursor='hand2')
+        self._tap_label.place(relx=0.5, rely=0.5, anchor='center')
+        self._tap_frame.bind('<Button-1>', lambda e: self._on_tap())
+        self._tap_label.bind('<Button-1>', lambda e: self._on_tap())
 
         # MIDI Clock SYNC ボタン
         self._sync_btn = tk.Label(
@@ -1323,21 +2381,76 @@ class AmbientApp:
                            value=val, bg=C_PANEL, fg=C_TEXT,
                            selectcolor=C_ACCENT, activebackground=C_PANEL,
                            command=self._on_density).pack(side='left', padx=6)
-        # Auto Evolve + Depth/Speed ノブ
-        evo_row = tk.Frame(f, bg=C_PANEL)
-        evo_row.pack(fill='x', pady=(8, 0))
-        self._evolve_var, _pb = pwr_btn(evo_row, 'Auto Evolve', C_PANEL,
-                                         initial=True, command=self._on_evolve)
-        _pb.pack(side='left')
+        # ── Auto Evolve ──────────────────────────────────
+        tk.Frame(f, bg='#2a2a4a', height=1).pack(fill='x', pady=(10, 8))
 
-        knob_row = tk.Frame(f, bg=C_PANEL)
-        knob_row.pack(fill='x', pady=(4, 0))
-        _, self._depth_knob = labeled_knob(
-            knob_row, 'Depth', 0, 100, 50, C_EVO, C_PANEL, self._on_depth)
-        self._depth_knob.master.pack(side='left', padx=(0, 16))
-        _, self._speed_knob = labeled_knob(
-            knob_row, 'Speed', 0, 100, 50, C_EVO, C_PANEL, self._on_speed)
-        self._speed_knob.master.pack(side='left')
+        # 大型トグルボタン
+        self._evolve_var = tk.BooleanVar(value=False)
+        self._evolve_btn = tk.Label(
+            f, text='⚡  AUTO EVOLVE',
+            bg='#111128', fg='#334466',
+            font=('Helvetica', 14, 'bold'),
+            padx=12, pady=10, cursor='hand2', anchor='center')
+        self._evolve_btn.pack(fill='x', pady=(0, 8))
+        self._evolve_btn.bind('<Button-1>', lambda e: self._on_evolve_toggle())
+
+        # XY パッド（Kaoss Pad）
+        pad_outer = tk.Frame(f, bg=C_PANEL)
+        pad_outer.pack()
+        self._kaoss_pad = KaossPad(pad_outer, command=self._on_kaoss)
+        self._kaoss_pad.pack()
+
+        # Auto Mod: モードボタン行
+        mode_row = tk.Frame(f, bg=C_PANEL)
+        mode_row.pack(fill='x', pady=(5, 2))
+        tk.Label(mode_row, text='MOD MODE', bg=C_PANEL, fg='#445566',
+                 font=('Helvetica', 7)).pack(side='left', padx=(0, 4))
+        self._am_mode_btns = {}
+        for key, label in [('random','RAND'), ('circle','○'), ('figure8','∞'), ('spiral','◌')]:
+            btn = tk.Label(mode_row, text=label,
+                           bg='#1e1e38', fg='#445566',
+                           font=('Helvetica', 9, 'bold'),
+                           padx=7, pady=3, cursor='hand2')
+            btn.bind('<Button-1>', lambda e, k=key: self._on_am_mode(k))
+            btn.pack(side='left', padx=1)
+            self._am_mode_btns[key] = btn
+        self._update_am_mode_buttons('random')
+
+        # Auto Mod スイッチ + 移動速度ノブ
+        am_row = tk.Frame(f, bg=C_PANEL)
+        am_row.pack(fill='x', pady=(2, 0))
+
+        self._auto_mod_var = tk.BooleanVar(value=False)
+        self._auto_mod_btn = tk.Label(
+            am_row, text='◎  AUTO MOD',
+            bg='#111128', fg='#445566',
+            font=('Helvetica', 10, 'bold'),
+            padx=10, pady=6, cursor='hand2')
+        self._auto_mod_btn.pack(side='left')
+        self._auto_mod_btn.bind('<Button-1>', lambda e: self._on_auto_mod_toggle())
+
+        _, self._am_speed_knob = labeled_knob(
+            am_row, 'Move Speed', 1, 100, 30,
+            '#ff9966', C_PANEL, self._on_am_speed)
+        self._am_speed_knob.master.pack(side='right', padx=(0, 4))
+
+        # ── ポインタデザイン 選択行 ──────────────────
+        tk.Frame(f, bg='#2a2a4a', height=1).pack(fill='x', pady=(8, 5))
+        sat_row = tk.Frame(f, bg=C_PANEL)
+        sat_row.pack(fill='x', pady=(0, 4))
+        tk.Label(sat_row, text='POINTER', bg=C_PANEL, fg='#445566',
+                 font=('Helvetica', 7)).pack(side='left', padx=(0, 4))
+        self._sat_type_btns = {}
+        for key, label in [('sputnik1', 'SP-1'), ('sputnik3', 'SP-3'),
+                            ('hawk', '鷹'), ('claude', 'CLaUDE')]:
+            btn = tk.Label(sat_row, text=label,
+                           bg='#1e1e38', fg='#445566',
+                           font=('Helvetica', 9, 'bold'),
+                           padx=8, pady=3, cursor='hand2')
+            btn.bind('<Button-1>', lambda e, k=key: self._on_sat_type(k))
+            btn.pack(side='left', padx=1)
+            self._sat_type_btns[key] = btn
+        self._update_sat_type_buttons('sputnik1')
 
     def _build_layers(self, parent):
         f = section(parent, 'Layers')
@@ -1348,7 +2461,9 @@ class AmbientApp:
             ('melody',  'MELODY',  'Ch.2', 1, 38, 0.30, 0.35),
             ('sparkle', 'SPARKLE', 'Ch.3', 2, 28, 0.60, 0.60),
         ]
-        self._layer_vars = {}
+        self._layer_vars   = {}
+        self._var_rand_btns = {}
+        self._var_knobs     = {}
 
         for key, label, ch_label, midi_ch, def_vel, def_var, def_rest in layers_cfg:
             BG = '#141428'
@@ -1379,18 +2494,102 @@ class AmbientApp:
                                   C_TEXT, BG, lambda v, k=key: self._on_vel(k, v))
             kv.master.pack(side='left', padx=10)
 
-            _, kvar = labeled_knob(knob_row, 'Variation', 0, 100, int(def_var*100),
-                                    C_VAR, BG, lambda v, k=key: self._on_variation(k, v))
-            kvar.master.pack(side='left', padx=10)
+            var_f, kvar = labeled_knob(knob_row, 'Variation', 0, 100, int(def_var*100),
+                                        C_VAR, BG, lambda v, k=key: self._on_variation(k, v))
+            rnd_var_btn = tk.Label(var_f, text='RND', bg=BG, fg='#4a9eff', relief='flat',
+                                   font=('Helvetica', 6, 'bold'), padx=3, pady=1, cursor='hand2')
+            rnd_var_btn.bind('<Button-1>', lambda e, k=key: self._on_variation_random(k))
+            rnd_var_btn.pack()
+            self._var_rand_btns[key] = rnd_var_btn
+            self._var_knobs[key] = kvar
+            var_f.pack(side='left', padx=10)
 
             _, krest = labeled_knob(knob_row, 'Rest', 0, 100, int(def_rest*100),
                                      C_REST, BG, lambda v, k=key: self._on_rest(k, v))
             krest.master.pack(side='left', padx=10)
 
-            # Melody のみ Speed ボタンを追加
+            # Melody のみ Octave / Range / Speed ボタンを追加
             if key == 'melody':
+                # Oct ボタン
+                oct_row = tk.Frame(block, bg=BG)
+                oct_row.pack(fill='x', pady=(6, 0))
+                tk.Label(oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._melody_oct_btns = {}
+                _oct_colors = {1: '#a9e4ff', 2: '#4dabf7', 3: '#69db7c', 4: '#ffa94d', 5: '#ff6b6b'}
+                for ov in [1, 2, 3, 4, 5]:
+                    b = tk.Label(oct_row, text=str(ov), width=3,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 9), pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, v=ov: self._on_melody_octave(v))
+                    b.pack(side='left', padx=1)
+                    self._melody_oct_btns[ov] = b
+                self._update_melody_oct_buttons(1)
+
+                # Range ボタン（音域オクターブ数）
+                rng_row = tk.Frame(block, bg=BG)
+                rng_row.pack(fill='x', pady=(4, 0))
+                tk.Label(rng_row, text='Range', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._melody_range_btns = {}
+                _rng_labels = {1: '1oct', 2: '2oct', 3: '3oct'}
+                _rng_colors = {1: '#69db7c', 2: '#ffa94d', 3: '#ff6b6b'}
+                for rv in [1, 2, 3]:
+                    b = tk.Label(rng_row, text=_rng_labels[rv],
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 8), padx=6, pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, v=rv: self._on_melody_range(v))
+                    b.pack(side='left', padx=1)
+                    self._melody_range_btns[rv] = b
+                self._update_melody_range_buttons(1)
+
+                # Character ボタン
+                char_row = tk.Frame(block, bg=BG)
+                char_row.pack(fill='x', pady=(4, 0))
+                tk.Label(char_row, text='Char', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._melody_char_btns = {}
+                _char_opts = [
+                    ('contour', 'Contour',  '#69db7c'),
+                    ('phrase',  'Phrase',   '#4dabf7'),
+                    ('motif',   'Motif',    '#ffa94d'),
+                    ('chord',   'ChordOnly','#f783ac'),
+                    ('simple',  'Simple',   '#a9e34b'),
+                ]
+                for ckey, clabel, ccol in _char_opts:
+                    b = tk.Label(char_row, text=clabel,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 8), padx=6, pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, k=ckey: self._on_melody_character(k))
+                    b.pack(side='left', padx=1)
+                    self._melody_char_btns[ckey] = (b, ccol)
+
+                # Rhythm ボタン
+                rhy_row = tk.Frame(block, bg=BG)
+                rhy_row.pack(fill='x', pady=(4, 0))
+                tk.Label(rhy_row, text='Rhythm', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._melody_rhythm_btns = {}
+                _rhy_opts = [
+                    ('free',    'Free',    '#555577'),
+                    ('flowing', 'Flowing', '#69db7c'),
+                    ('dotted',  'Dotted',  '#4dabf7'),
+                    ('synco',   'Synco',   '#ffa94d'),
+                    ('staccato','Staccato','#ff6b6b'),
+                    ('breath',  'Breath',  '#da77f2'),
+                ]
+                for rkey, rlabel, rcol in _rhy_opts:
+                    b = tk.Label(rhy_row, text=rlabel,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 7), padx=4, pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, k=rkey: self._on_melody_rhythm(k))
+                    b.pack(side='left', padx=1)
+                    self._melody_rhythm_btns[rkey] = (b, rcol)
+                self._update_melody_rhythm_buttons('free')
+
+                # Speed ボタン
                 spd_row = tk.Frame(block, bg=BG)
-                spd_row.pack(fill='x', pady=(6, 0))
+                spd_row.pack(fill='x', pady=(4, 0))
                 tk.Label(spd_row, text='Speed', bg=BG, fg=C_MUTED,
                          font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
                 self._melody_speed_btns = {}
@@ -1409,7 +2608,7 @@ class AmbientApp:
                 self._melody_speed_rand_btn.pack(side='left', padx=(6, 0))
                 self._update_melody_speed_buttons(1.0)
 
-            # Drone のみオクターブ選択を追加
+            # Drone のみオクターブ選択 + ROOT/CHORD トグルを追加
             if key == 'drone':
                 oct_row = tk.Frame(block, bg=BG)
                 oct_row.pack(fill='x', pady=(6, 0))
@@ -1424,6 +2623,21 @@ class AmbientApp:
                     btn.pack(side='left', padx=1)
                     self._drone_oct_btns[ov] = btn
                 self._update_drone_oct_buttons(3)
+
+                # ROOT / CHORD 追従トグル
+                follow_row = tk.Frame(block, bg=BG)
+                follow_row.pack(fill='x', pady=(4, 0))
+                tk.Label(follow_row, text='Follow', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._drone_follow_btns = {}
+                for fkey, flabel in [('root', 'ROOT'), ('chord', 'CHORD')]:
+                    b = tk.Label(follow_row, text=flabel, width=6,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 8), pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, k=fkey: self._on_drone_follow(k))
+                    b.pack(side='left', padx=1)
+                    self._drone_follow_btns[fkey] = b
+                self._update_drone_follow_buttons('root')
 
         # ---- CHORD ブロック ----
         C_CHORD = '#7ecfe0'
@@ -1666,28 +2880,52 @@ class AmbientApp:
             self._bpm_knob.set(bpm)
 
     def _bpm_blink_tick(self):
-        """TAPボタンを現在BPMで点滅させる（常時動作）"""
+        """TAPボタンを現在BPMで赤く点滅させる（常時動作）"""
         bpm = STATE.bpm
         beat_ms = max(100, int(60000 / bpm))
-        # 点灯
-        self._tap_btn.config(bg='#00c896', fg='#0f0f1e')
+        # 点灯（やわらかい赤で塗りつぶし）
+        self._tap_frame.config(bg='#7a2a2a')
+        self._tap_label.config(bg='#7a2a2a', fg='#cc8888')
         # 80ms後に消灯
-        self.root.after(80, lambda: self._tap_btn.config(bg='#1e1e38', fg='#aaaacc'))
+        self.root.after(80, lambda: (
+            self._tap_frame.config(bg='#1e1e38'),
+            self._tap_label.config(bg='#1e1e38', fg='#aaaacc')
+        ))
         # 次の拍でまた点灯
         self.root.after(beat_ms, self._bpm_blink_tick)
 
     def _on_root(self, semitone):
-        new_root = semitone + self._oct_var.get() * 12
-        self._root_var.set(new_root)
-        with STATE._lock: STATE.root = new_root
-        self._update_root_buttons()
+        if STATE.auto_root:
+            # AUTO ON: ピッチクラスをプールにトグル（最低1つ残す）
+            pool = list(STATE.auto_root_pool)
+            if semitone in pool:
+                if len(pool) > 1:
+                    pool.remove(semitone)
+            else:
+                pool.append(semitone)
+            with STATE._lock:
+                STATE.auto_root_pool = pool
+            self._update_root_buttons()
+        else:
+            new_root = semitone + self._oct_var.get() * 12
+            self._root_var.set(new_root)
+            with STATE._lock: STATE.root = new_root
+            self._update_root_buttons()
 
     def _on_octave(self):
         new_root = STATE.root % 12 + self._oct_var.get() * 12
         with STATE._lock: STATE.root = new_root
 
     def _on_random_root(self):
-        new_root = random.choice(list(range(36, 61)))
+        pool = STATE.auto_root_pool
+        if pool:
+            pc = random.choice(pool)
+            base_oct = STATE.root // 12
+            new_root = pc + base_oct * 12
+            if new_root < 36: new_root += 12
+            if new_root > 60: new_root -= 12
+        else:
+            new_root = random.choice(list(range(36, 61)))
         with STATE._lock: STATE.root = new_root
         self._update_root_buttons()
         self._log(f"[Root] → {NOTE_NAMES[new_root % 12]}{new_root//12-1}")
@@ -1700,10 +2938,36 @@ class AmbientApp:
             self._rdn_btn.config(bg='#5a0000', fg='#ff4444')
         else:
             self._rdn_btn.config(bg='#2a2a4a', fg='#666688')
+        # ボタン表示をプール/範囲モードに切り替え
+        self._update_root_buttons()
+        if on:
+            self._update_bar_range_buttons(
+                self._root_bar_btns, BAR_OPTIONS,
+                STATE.auto_root_bars_min, STATE.auto_root_bars_max)
+        else:
+            self._update_bar_buttons(self._root_bar_btns, STATE.auto_root_bars)
 
     def _on_root_bars(self, val):
-        with STATE._lock: STATE.auto_root_bars = val
-        self._update_bar_buttons(self._root_bar_btns, val)
+        if STATE.auto_root:
+            # AUTO ON: 範囲の下限/上限をインデックス距離で振り分け
+            all_v = BAR_OPTIONS
+            idx_v  = all_v.index(val)
+            idx_lo = all_v.index(STATE.auto_root_bars_min) if STATE.auto_root_bars_min in all_v else 0
+            idx_hi = all_v.index(STATE.auto_root_bars_max) if STATE.auto_root_bars_max in all_v else len(all_v)-1
+            with STATE._lock:
+                if abs(idx_v - idx_lo) <= abs(idx_v - idx_hi):
+                    STATE.auto_root_bars_min = val
+                else:
+                    STATE.auto_root_bars_max = val
+                if STATE.auto_root_bars_min > STATE.auto_root_bars_max:
+                    STATE.auto_root_bars_min, STATE.auto_root_bars_max = \
+                        STATE.auto_root_bars_max, STATE.auto_root_bars_min
+            self._update_bar_range_buttons(
+                self._root_bar_btns, BAR_OPTIONS,
+                STATE.auto_root_bars_min, STATE.auto_root_bars_max)
+        else:
+            with STATE._lock: STATE.auto_root_bars = val
+            self._update_bar_buttons(self._root_bar_btns, val)
 
     def _on_scale_bars(self, val):
         with STATE._lock: STATE.auto_scale_bars = val
@@ -1720,6 +2984,23 @@ class AmbientApp:
                 btn.config(bg='#1e1e38', fg='#4a9eff',
                            font=('Helvetica', 8))
 
+    def _update_bar_range_buttons(self, btns, all_opts, lo, hi):
+        """AUTO ON時: 範囲内は色付き、範囲外はくすんだ表示"""
+        colors = {0: '#aaaaaa', 1: '#ff6b6b', 2: '#ffa94d', 4: '#ffe066',
+                  8: '#69db7c', 16: '#4dabf7', 32: '#cc5de8', 64: '#f783ac'}
+        for b, btn in btns.items():
+            in_range = (lo <= b <= hi)
+            is_edge  = (b == lo or b == hi)
+            if is_edge:
+                btn.config(bg=colors.get(b, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 9, 'bold'))
+            elif in_range:
+                btn.config(bg='#2a2a3a', fg=colors.get(b, '#aaaacc'),
+                           font=('Helvetica', 8))
+            else:
+                btn.config(bg='#1e1e38', fg='#333355',
+                           font=('Helvetica', 8))
+
     def _on_scale(self, _=None):
         with STATE._lock: STATE.scale_name = self._scale_var.get()
 
@@ -1729,14 +3010,57 @@ class AmbientApp:
     def _on_density(self):
         with STATE._lock: STATE.density = self._density_var.get()
 
-    def _on_evolve(self):
-        with STATE._lock: STATE.auto_evolve = self._evolve_var.get()
+    def _on_evolve_toggle(self):
+        v = not self._evolve_var.get()
+        self._evolve_var.set(v)
+        with STATE._lock: STATE.auto_evolve = v
+        if v:
+            self._evolve_btn.config(bg='#0f1f3a', fg=C_EVO)
+        else:
+            self._evolve_btn.config(bg='#111128', fg='#334466')
 
-    def _on_depth(self, val):
-        with STATE._lock: STATE.evolve_depth = int(val) / 100.0
+    def _on_kaoss(self, x, y):
+        # x = Speed (0-1), y = Depth (0-1)
+        with STATE._lock:
+            STATE.evolve_speed = x
+            STATE.evolve_depth = y
 
-    def _on_speed(self, val):
-        with STATE._lock: STATE.evolve_speed = int(val) / 100.0
+    def _on_auto_mod_toggle(self):
+        v = not self._auto_mod_var.get()
+        self._auto_mod_var.set(v)
+        if v:
+            self._auto_mod_btn.config(bg='#1a1a2e', fg='#ff9966')
+            speed = self._am_speed_knob.get() / 100.0
+            self._kaoss_pad.set_am_speed(speed)
+            self._kaoss_pad.auto_mod_start()
+        else:
+            self._auto_mod_btn.config(bg='#111128', fg='#445566')
+            self._kaoss_pad.auto_mod_stop()
+
+    def _on_am_speed(self, val):
+        self._kaoss_pad.set_am_speed(float(val) / 100.0)
+
+    def _on_am_mode(self, key):
+        self._kaoss_pad.set_am_mode(key)
+        self._update_am_mode_buttons(key)
+
+    def _update_am_mode_buttons(self, selected):
+        for k, btn in self._am_mode_btns.items():
+            if k == selected:
+                btn.config(bg='#2a2a5a', fg='#ff9966')
+            else:
+                btn.config(bg='#1e1e38', fg='#445566')
+
+    def _on_sat_type(self, key):
+        self._kaoss_pad.set_sat_type(key)
+        self._update_sat_type_buttons(key)
+
+    def _update_sat_type_buttons(self, selected):
+        for k, btn in self._sat_type_btns.items():
+            if k == selected:
+                btn.config(bg='#2a2a5a', fg='#9b8cf0')
+            else:
+                btn.config(bg='#1e1e38', fg='#445566')
 
     def _on_layer(self, key):
         with STATE._lock: STATE.layers[key] = self._layer_vars[key].get()
@@ -1747,6 +3071,32 @@ class AmbientApp:
     def _on_variation(self, key, val):
         with STATE._lock: STATE.variation[key] = int(val) / 100.0
 
+    def _on_variation_random(self, key):
+        new_val = not STATE.variation_random[key]
+        with STATE._lock: STATE.variation_random[key] = new_val
+        btn = self._var_rand_btns.get(key)
+        if btn:
+            if new_val:
+                btn.config(bg='#da77f2', fg='#0f0f1e')
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff')
+
+    def _auto_variation_tick(self):
+        if not self._playing:
+            return
+        s = STATE.get()
+        beat_ms = max(200, int(60000 / s['bpm']))
+        # 4〜8拍ごとにランダム更新
+        interval_ms = random.randint(4, 8) * beat_ms
+        for key in ['drone', 'melody', 'sparkle', 'chord']:
+            if s['variation_random'].get(key):
+                new_var = round(random.random(), 2)
+                with STATE._lock: STATE.variation[key] = new_var
+                knob = self._var_knobs.get(key)
+                if knob:
+                    self.root.after(0, lambda k=knob, v=new_var: k.set(int(v * 100)))
+        self.root.after(interval_ms, self._auto_variation_tick)
+
     def _on_rest(self, key, val):
         with STATE._lock: STATE.rest_prob[key] = int(val) / 100.0
 
@@ -1756,12 +3106,30 @@ class AmbientApp:
     def _on_arp_mode(self, _=None):
         with STATE._lock: STATE.arp_mode = self._arp_mode_var.get()
 
+    _ARP_RATE_VALS = [0.125, 0.25, 0.5, 1.0, 2.0, 4.0]
+
     def _on_arp_rate_btn(self, val):
-        with STATE._lock:
-            STATE.arp_rate        = val
-            STATE.arp_rate_random = False
-        self._arp_rand_var.set(False)
-        self._update_arp_rate_buttons(val)
+        if STATE.arp_rate_random:
+            # RAND ON: インデックス距離で近い方の境界を更新
+            with STATE._lock:
+                lo, hi    = STATE.arp_rate_rand_min, STATE.arp_rate_rand_max
+                all_v     = self._ARP_RATE_VALS
+                idx_v     = all_v.index(val)
+                idx_lo    = all_v.index(lo) if lo in all_v else 0
+                idx_hi    = all_v.index(hi) if hi in all_v else len(all_v) - 1
+                if abs(idx_v - idx_lo) < abs(idx_v - idx_hi):
+                    STATE.arp_rate_rand_min = val
+                else:
+                    STATE.arp_rate_rand_max = val
+                if STATE.arp_rate_rand_min > STATE.arp_rate_rand_max:
+                    STATE.arp_rate_rand_min, STATE.arp_rate_rand_max = \
+                        STATE.arp_rate_rand_max, STATE.arp_rate_rand_min
+        else:
+            with STATE._lock:
+                STATE.arp_rate        = val
+                STATE.arp_rate_random = False
+            self._arp_rand_var.set(False)
+        self._update_arp_rate_buttons(STATE.arp_rate)
 
     def _on_arp_rate_random(self):
         new_state = not self._arp_rand_var.get()
@@ -1771,12 +3139,24 @@ class AmbientApp:
 
     def _update_arp_rate_buttons(self, selected):
         rand_on = self._arp_rand_var.get() if hasattr(self, '_arp_rand_var') else False
+        lo = STATE.arp_rate_rand_min
+        hi = STATE.arp_rate_rand_max
         for val, btn in self._arp_rate_btns.items():
-            if not rand_on and val == selected:
-                col = ARP_RATE_COLORS.get(val, '#69db7c')
-                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+            col = ARP_RATE_COLORS.get(val, '#69db7c')
+            if rand_on:
+                in_range = lo - 0.001 <= val <= hi + 0.001
+                is_edge  = abs(val - lo) < 0.001 or abs(val - hi) < 0.001
+                if in_range and is_edge:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+                elif in_range:
+                    btn.config(bg='#2a2a3a', fg=col,  font=('Helvetica', 8))
+                else:
+                    btn.config(bg='#1e1e38', fg='#333355', font=('Helvetica', 8))
             else:
-                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+                if val == selected:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+                else:
+                    btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
         if hasattr(self, '_arp_rand_btn'):
             if rand_on:
                 self._arp_rand_btn.config(bg='#da77f2', fg='#0f0f1e',
@@ -1897,6 +3277,75 @@ class AmbientApp:
                 btn.config(bg='#1e1e38', fg='#4a9eff',
                            font=('Helvetica', 9))
 
+    def _on_melody_octave(self, val):
+        with STATE._lock: STATE.melody_octave = val
+        self._update_melody_oct_buttons(val)
+
+    def _update_melody_oct_buttons(self, selected):
+        colors = {1: '#a9e4ff', 2: '#4dabf7', 3: '#69db7c', 4: '#ffa94d', 5: '#ff6b6b'}
+        for ov, btn in self._melody_oct_btns.items():
+            if ov == selected:
+                btn.config(bg=colors.get(ov, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 9, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff',
+                           font=('Helvetica', 9))
+
+    def _on_melody_range(self, val):
+        with STATE._lock: STATE.melody_range = val
+        self._update_melody_range_buttons(val)
+
+    def _update_melody_range_buttons(self, selected):
+        colors = {1: '#69db7c', 2: '#ffa94d', 3: '#ff6b6b'}
+        for rv, btn in self._melody_range_btns.items():
+            if rv == selected:
+                btn.config(bg=colors.get(rv, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 8, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff',
+                           font=('Helvetica', 8))
+
+    def _on_melody_rhythm(self, key):
+        with STATE._lock: STATE.melody_rhythm = key
+        self._update_melody_rhythm_buttons(key)
+
+    def _update_melody_rhythm_buttons(self, selected):
+        for key, (btn, col) in self._melody_rhythm_btns.items():
+            if key == selected:
+                btn.config(bg=col if col != '#555577' else '#3a3a5a',
+                           fg='#0f0f1e' if col != '#555577' else '#aaaacc',
+                           font=('Helvetica', 7, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 7))
+
+    def _on_melody_character(self, key):
+        chars = list(STATE.melody_character)
+        if key in chars:
+            chars.remove(key)
+        else:
+            chars.append(key)
+        with STATE._lock: STATE.melody_character = chars
+        self._update_melody_char_buttons(chars)
+
+    def _update_melody_char_buttons(self, chars):
+        for key, (btn, col) in self._melody_char_btns.items():
+            if key in chars:
+                btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 8, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+
+    def _on_drone_follow(self, key):
+        with STATE._lock: STATE.drone_follow = key
+        self._update_drone_follow_buttons(key)
+
+    def _update_drone_follow_buttons(self, selected):
+        colors = {'root': '#69db7c', 'chord': '#4dabf7'}
+        for key, btn in self._drone_follow_btns.items():
+            if key == selected:
+                btn.config(bg=colors[key], fg='#0f0f1e', font=('Helvetica', 8, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff', font=('Helvetica', 8))
+
     def _on_chord_octave(self):
         with STATE._lock: STATE.chord_octave = self._chord_oct_var.get()
 
@@ -1956,10 +3405,36 @@ class AmbientApp:
         cur_qual_lbl = next((l for l, ivs in CHORD_QUALITIES if ivs == STATE.chord_quality), 'maj')
         self._update_chord_degree_buttons(STATE.chord_degree)
         self._update_chord_quality_buttons(cur_qual_lbl)
+        _CHORD_BAR_OPTS = [2, 4, 8, 16]
+        if new:
+            self._update_bar_range_buttons(
+                self._chord_auto_bar_btns, _CHORD_BAR_OPTS,
+                STATE.chord_auto_bars_min, STATE.chord_auto_bars_max)
+        else:
+            self._update_bar_buttons(self._chord_auto_bar_btns, STATE.chord_auto_bars)
 
     def _on_chord_auto_bars(self, val):
-        with STATE._lock: STATE.chord_auto_bars = val
-        self._update_bar_buttons(self._chord_auto_bar_btns, val)
+        _CHORD_BAR_OPTS = [2, 4, 8, 16]
+        if STATE.chord_auto:
+            idx_v  = _CHORD_BAR_OPTS.index(val)
+            idx_lo = _CHORD_BAR_OPTS.index(STATE.chord_auto_bars_min) \
+                     if STATE.chord_auto_bars_min in _CHORD_BAR_OPTS else 0
+            idx_hi = _CHORD_BAR_OPTS.index(STATE.chord_auto_bars_max) \
+                     if STATE.chord_auto_bars_max in _CHORD_BAR_OPTS else len(_CHORD_BAR_OPTS)-1
+            with STATE._lock:
+                if abs(idx_v - idx_lo) <= abs(idx_v - idx_hi):
+                    STATE.chord_auto_bars_min = val
+                else:
+                    STATE.chord_auto_bars_max = val
+                if STATE.chord_auto_bars_min > STATE.chord_auto_bars_max:
+                    STATE.chord_auto_bars_min, STATE.chord_auto_bars_max = \
+                        STATE.chord_auto_bars_max, STATE.chord_auto_bars_min
+            self._update_bar_range_buttons(
+                self._chord_auto_bar_btns, _CHORD_BAR_OPTS,
+                STATE.chord_auto_bars_min, STATE.chord_auto_bars_max)
+        else:
+            with STATE._lock: STATE.chord_auto_bars = val
+            self._update_bar_buttons(self._chord_auto_bar_btns, val)
 
     def _update_chord_degree_buttons(self, selected):
         auto_on  = STATE.chord_auto
@@ -2041,18 +3516,21 @@ class AmbientApp:
         s = STATE.get()
         if s['arp_auto']:
             new_mode  = random.choice(['up', 'down', 'zigzag', 'random'])
-            new_rate  = random.choice([v for _, v in ARP_RATES])
             new_oct   = random.choice([1, 2, 3])
             new_range = random.choice([1, 2, 3])
+            # レートは RAND が OFF の時だけ変更（ON の時は RAND 設定を維持）
+            lo, hi    = s['arp_rate_rand_min'], s['arp_rate_rand_max']
+            rate_pool = [v for _, v in ARP_RATES if lo - 0.001 <= v <= hi + 0.001]
+            new_rate  = random.choice(rate_pool if rate_pool else [v for _, v in ARP_RATES])
             with STATE._lock:
                 STATE.arp_mode        = new_mode
-                STATE.arp_rate        = new_rate
-                STATE.arp_rate_random = False
                 STATE.chord_octave    = new_oct
                 STATE.chord_oct_range = new_range
-            # UI 同期
+                if not STATE.arp_rate_random:
+                    # RAND OFF の時だけ固定レートを変更
+                    STATE.arp_rate = new_rate
+            # UI 同期（RAND ボタンの状態は変えない）
             self._arp_mode_var.set(new_mode)
-            self._arp_rand_var.set(False)
             self._chord_oct_var.set(new_oct)
             self._chord_oct_range_var.set(new_range)
             self._update_arp_rate_buttons(new_rate)
@@ -2074,19 +3552,31 @@ class AmbientApp:
     }
 
     def _update_root_buttons(self):
-        root = STATE.root
+        root         = STATE.root
+        auto_on      = STATE.auto_root
+        pool         = STATE.auto_root_pool
         current_name = NOTE_NAMES[root % 12]
-        octave = root // 12 - 1
+        octave       = root // 12 - 1
         for name, btn in self._note_btns.items():
             is_sharp = '#' in name
-            if name == current_name:
-                col = self.NOTE_COLORS.get(name, C_ACCENT)
-                btn.config(bg=col, fg='#0f0f1e',
-                           font=('Helvetica', 9, 'bold'))
+            idx = NOTE_NAMES.index(name)
+            col = self.NOTE_COLORS.get(name, C_ACCENT)
+            if auto_on:
+                in_pool = idx in pool
+                is_cur  = name == current_name
+                if in_pool and is_cur:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+                elif in_pool:
+                    btn.config(bg='#2a2a3a', fg=col, font=('Helvetica', 8, 'normal'))
+                else:
+                    btn.config(bg='#1e1e38' if is_sharp else '#1e2030',
+                               fg='#333355', font=('Helvetica', 8, 'normal'))
             else:
-                btn.config(bg='#1e1e38' if is_sharp else '#1e2030',
-                           fg='#4a9eff',
-                           font=('Helvetica', 8, 'normal'))
+                if name == current_name:
+                    btn.config(bg=col, fg='#0f0f1e', font=('Helvetica', 9, 'bold'))
+                else:
+                    btn.config(bg='#1e1e38' if is_sharp else '#1e2030',
+                               fg='#4a9eff', font=('Helvetica', 8, 'normal'))
         if self._current_root_lbl:
             col = self.NOTE_COLORS.get(current_name, C_ON)
             self._current_root_lbl.config(
@@ -2160,9 +3650,12 @@ class AmbientApp:
                 STATE.chord_quality = new_qual
             self._update_chord_degree_buttons(new_deg)
             self._update_chord_quality_buttons(new_qual_lbl)
-            next_bars = random.choice([2, 4, 8, 16])
+            _CHORD_BAR_OPTS = [2, 4, 8, 16]
+            lo, hi = s['chord_auto_bars_min'], s['chord_auto_bars_max']
+            bar_pool = [b for b in _CHORD_BAR_OPTS if lo <= b <= hi] or _CHORD_BAR_OPTS
+            next_bars = random.choice(bar_pool)
             with STATE._lock: STATE.chord_auto_bars = next_bars
-            self._update_bar_buttons(self._chord_auto_bar_btns, next_bars)
+            self._update_bar_range_buttons(self._chord_auto_bar_btns, _CHORD_BAR_OPTS, lo, hi)
             self._log(f"[Auto Chord] → {new_deg_lbl}{new_qual_lbl}  次: {next_bars}小節後")
             interval = bars_to_ms(next_bars, s['bpm'])
         else:
@@ -2178,19 +3671,29 @@ class AmbientApp:
         self.root.after(500, self._auto_arp_tick)
         self.root.after(500, self._auto_chord_tick)
         self.root.after(500, self._auto_melody_speed_tick)
+        self.root.after(500, self._auto_variation_tick)
 
     def _auto_root_tick(self):
         if not self._playing:
             return
         s = STATE.get()
         if s['auto_root']:
-            new_root = random.choice(list(range(36, 61)))
+            pool = s['auto_root_pool']
+            # プールから音名を選び、現在のオクターブ帯（36〜60）に収める
+            pc = random.choice(pool)
+            base_oct = (STATE.root // 12)   # 現在のオクターブを維持
+            new_root = pc + base_oct * 12
+            # 36〜60 の範囲に収まるよう調整
+            if new_root < 36: new_root += 12
+            if new_root > 60: new_root -= 12
             with STATE._lock: STATE.root = new_root
             name = NOTE_NAMES[new_root % 12]
-            # 次の小節数をランダム選択
-            next_bars = random.choice(BAR_OPTIONS)
+            # 次の小節数を範囲内からランダム選択
+            lo, hi = s['auto_root_bars_min'], s['auto_root_bars_max']
+            bar_pool = [b for b in BAR_OPTIONS if lo <= b <= hi] or BAR_OPTIONS
+            next_bars = random.choice(bar_pool)
             with STATE._lock: STATE.auto_root_bars = next_bars
-            self._update_bar_buttons(self._root_bar_btns, next_bars)
+            self._update_bar_range_buttons(self._root_bar_btns, BAR_OPTIONS, lo, hi)
             self._log(f"[Auto Root] → {name}{new_root//12-1}  次: {next_bars}小節後")
             self._update_root_buttons()
             interval = bars_to_ms(next_bars, s['bpm'])
