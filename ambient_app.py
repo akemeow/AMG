@@ -2114,8 +2114,18 @@ class AmbientApp:
             _phase_y = random.uniform(0, 2 * math.pi)
             # X 軸（Y と異なる速度・位相でリサージュ的な軌跡に）
             _amp_x   = random.uniform(5.0, 10.0)
-            _speed_x = _speed_y * random.uniform(0.55, 0.80)  # Y より遅め
+            _speed_x = _speed_y * random.uniform(0.55, 0.80)
             _phase_x = random.uniform(0, 2 * math.pi)
+
+            # クリックで最前面に（子ウィジェットへ再帰バインド）
+            def _raise(e=None, _id=item_id):
+                mc.tag_raise(_id)
+            def _bind_raise(w):
+                w.bind('<Button-1>', _raise, add='+')
+                for child in w.winfo_children():
+                    _bind_raise(child)
+            _bind_raise(frame)
+
             self._float_panels.append({
                 'item_id': item_id,
                 'frame':   frame,
