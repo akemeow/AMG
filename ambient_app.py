@@ -2081,76 +2081,90 @@ class AmbientApp:
 
     # ---- UI構築 ----------------------------------------
     def _build_ui(self):
-        # ウィンドウ初期サイズ（スクロール可能にするため高さを固定）
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        win_h = min(760, sh - 80)
-        win_w = min(860, sw - 40)
+        win_w = min(1400, sw - 20)
+        win_h = min(900, sh - 40)
         self.root.geometry(f'{win_w}x{win_h}')
+        self.root.minsize(1100, 720)
 
-        # タイトルバー（固定）
-        title_bar = tk.Frame(self.root, bg=C_BG, pady=12)
+        # ── タイトルバー ──────────────────────────────────────────────
+        title_bar = tk.Frame(self.root, bg=C_BG, pady=7)
         title_bar.pack(fill='x', padx=16)
-        tk.Label(title_bar, text='AMBIENT GENERATOR',
+        tk.Label(title_bar, text='✦  AMBIENT GENERATOR  ✦',
                  bg=C_BG, fg=C_TEXT,
-                 font=('Helvetica', 15, 'bold')).pack(side='left')
+                 font=('Helvetica', 13, 'bold')).pack(side='left')
         self._status_lbl = tk.Label(title_bar, text='● STOPPED',
                                     bg=C_BG, fg=C_OFF,
                                     font=('Helvetica', 9, 'bold'))
         self._status_lbl.pack(side='right')
 
-        # ── スクロール可能エリア ──
-        scroll_frame = tk.Frame(self.root, bg=C_BG)
-        scroll_frame.pack(fill='both', expand=True)
+        # ── Place de l'Étoile メインキャンバス ────────────────────────
+        mc = tk.Canvas(self.root, bg=C_BG, highlightthickness=0)
+        mc.pack(fill='both', expand=True)
+        self._radial_canvas = mc
 
-        scrollbar = ttk.Scrollbar(scroll_frame, orient='vertical')
-        scrollbar.pack(side='right', fill='y')
+        CX, CY = 700, 440   # 凱旋門（中央ハブ）座標
 
-        canvas = tk.Canvas(scroll_frame, bg=C_BG, highlightthickness=0,
-                           yscrollcommand=scrollbar.set)
-        canvas.pack(side='left', fill='both', expand=True)
-        scrollbar.config(command=canvas.yview)
+        def pw(frame, x, y, anchor='center'):
+            mc.create_window(x, y, window=frame, anchor=anchor)
 
-        inner = tk.Frame(canvas, bg=C_BG)
-        win_id = canvas.create_window(0, 0, anchor='nw', window=inner)
+        # コントロール辞書を初期化
+        self._layer_vars    = {}
+        self._var_rand_btns = {}
+        self._var_knobs     = {}
 
-        def _on_inner_configure(e):
-            canvas.configure(scrollregion=canvas.bbox('all'))
-        inner.bind('<Configure>', _on_inner_configure)
+        # ── 中央ハブ（KaossPad + AUTO EVOLVE + AUTO MOD）────────────
+        hub = tk.Frame(mc, bg=C_BG)
+        self._build_kaoss_hub(hub)
+        pw(hub, CX, CY)
 
-        def _on_canvas_configure(e):
-            canvas.itemconfig(win_id, width=e.width)
-        canvas.bind('<Configure>', _on_canvas_configure)
+        # ── N: Transport ─────────────────────────────────────────────
+        f_tr = tk.Frame(mc, bg=C_BG)
+        self._build_transport(f_tr)
+        pw(f_tr, CX, 92)
 
-        canvas.configure(yscrollincrement=1)
+        # ── NW: Key + Scale ──────────────────────────────────────────
+        f_ks = tk.Frame(mc, bg=C_BG)
+        self._build_key(f_ks)
+        self._build_scale(f_ks)
+        pw(f_ks, 400, 195)
 
-        def _page_scroll(e):
-            d = getattr(e, 'delta', 0)
-            if d != 0:
-                canvas.yview_scroll(int(-d * 4), 'units')
+        # ── W: Chord Type + Density ──────────────────────────────────
+        f_cd = tk.Frame(mc, bg=C_BG)
+        self._build_chord_type(f_cd)
+        self._build_density(f_cd)
+        pw(f_cd, 228, CY)
 
-        # Tk 8.6: bind_all でノブ以外の全ウィジェットからスクロール
-        self.root.bind_all('<MouseWheel>', _page_scroll)
-        self.root.bind_all('<Button-4>', lambda e: canvas.yview_scroll(-40, 'units'))
-        self.root.bind_all('<Button-5>', lambda e: canvas.yview_scroll( 40, 'units'))
+        # ── SW: Drone Layer ──────────────────────────────────────────
+        f_dn = tk.Frame(mc, bg=C_BG)
+        self._build_drone_panel(f_dn)
+        pw(f_dn, 390, 710)
 
-        cols = tk.Frame(inner, bg=C_BG)
-        cols.pack(fill='both', padx=12, pady=4)
+        # ── S: Log ───────────────────────────────────────────────────
+        f_lg = tk.Frame(mc, bg=C_BG)
+        self._build_log(f_lg)
+        pw(f_lg, CX, 808)
 
-        left  = tk.Frame(cols, bg=C_BG)
-        right = tk.Frame(cols, bg=C_BG)
-        left.pack(side='left', fill='both', expand=True, padx=(0, 6))
-        right.pack(side='left', fill='both', expand=True)
+        # ── SE: Chord ARP ────────────────────────────────────────────
+        f_ca = tk.Frame(mc, bg=C_BG)
+        self._build_chord_panel(f_ca)
+        pw(f_ca, 1010, 710)
 
-        self._build_transport(left)
-        self._build_key(left)
-        self._build_scale(left)
-        self._build_chord_type(left)
-        self._build_density(left)
-        self._build_layers(right)
-        self._build_log(right)
+        # ── E: Melody Layer ──────────────────────────────────────────
+        f_ml = tk.Frame(mc, bg=C_BG)
+        self._build_melody_panel(f_ml)
+        pw(f_ml, 1172, CY)
 
-        # テンポブリンク開始（UI構築後）
+        # ── NE: Sparkle Layer ────────────────────────────────────────
+        f_sp = tk.Frame(mc, bg=C_BG)
+        self._build_sparkle_panel(f_sp)
+        pw(f_sp, 1000, 195)
+
+        # ── 放射状デコレーションを描画 ───────────────────────────────
+        self.root.after(150, lambda: self._draw_radial_bg(mc, CX, CY))
+
+        # BPM ブリンク開始
         self.root.after(100, self._bpm_blink_tick)
 
 
@@ -2388,32 +2402,35 @@ class AmbientApp:
                            value=val, bg=C_PANEL, fg=C_TEXT,
                            selectcolor=C_ACCENT, activebackground=C_PANEL,
                            command=self._on_density).pack(side='left', padx=6)
-        # ── Auto Evolve ──────────────────────────────────
-        tk.Frame(f, bg='#2a2a4a', height=1).pack(fill='x', pady=(10, 8))
 
-        # 大型トグルボタン
+    def _build_kaoss_hub(self, parent):
+        """中央ハブ: KaossPad + AUTO EVOLVE + AUTO MOD + POINTER"""
+        f = tk.Frame(parent, bg=C_BG)
+
+        # AUTO EVOLVE ボタン
         self._evolve_var = tk.BooleanVar(value=False)
         self._evolve_btn = tk.Label(
             f, text='⚡  AUTO EVOLVE',
             bg='#111128', fg='#334466',
             font=('Helvetica', 14, 'bold'),
             padx=12, pady=10, cursor='hand2', anchor='center')
-        self._evolve_btn.pack(fill='x', pady=(0, 8))
+        self._evolve_btn.pack(fill='x', pady=(0, 6))
         self._evolve_btn.bind('<Button-1>', lambda e: self._on_evolve_toggle())
 
         # XY パッド（Kaoss Pad）
-        pad_outer = tk.Frame(f, bg=C_PANEL)
+        pad_outer = tk.Frame(f, bg=C_BG)
         pad_outer.pack()
         self._kaoss_pad = KaossPad(pad_outer, command=self._on_kaoss)
         self._kaoss_pad.pack()
 
-        # Auto Mod: モードボタン行
-        mode_row = tk.Frame(f, bg=C_PANEL)
+        # Auto Mod モードボタン行
+        mode_row = tk.Frame(f, bg=C_BG)
         mode_row.pack(fill='x', pady=(5, 2))
-        tk.Label(mode_row, text='MOD MODE', bg=C_PANEL, fg='#445566',
+        tk.Label(mode_row, text='MOD MODE', bg=C_BG, fg='#445566',
                  font=('Helvetica', 7)).pack(side='left', padx=(0, 4))
         self._am_mode_btns = {}
-        for key, label in [('random','RAND'), ('circle','○'), ('figure8','∞'), ('spiral','◌')]:
+        for key, label in [('random', 'RAND'), ('circle', '○'),
+                            ('figure8', '∞'), ('spiral', '◌')]:
             btn = tk.Label(mode_row, text=label,
                            bg='#1e1e38', fg='#445566',
                            font=('Helvetica', 9, 'bold'),
@@ -2423,10 +2440,9 @@ class AmbientApp:
             self._am_mode_btns[key] = btn
         self._update_am_mode_buttons('random')
 
-        # Auto Mod スイッチ + 移動速度ノブ
-        am_row = tk.Frame(f, bg=C_PANEL)
+        # AUTO MOD スイッチ + 移動速度ノブ
+        am_row = tk.Frame(f, bg=C_BG)
         am_row.pack(fill='x', pady=(2, 0))
-
         self._auto_mod_var = tk.BooleanVar(value=False)
         self._auto_mod_btn = tk.Label(
             am_row, text='◎  AUTO MOD',
@@ -2435,17 +2451,16 @@ class AmbientApp:
             padx=10, pady=6, cursor='hand2')
         self._auto_mod_btn.pack(side='left')
         self._auto_mod_btn.bind('<Button-1>', lambda e: self._on_auto_mod_toggle())
-
         _, self._am_speed_knob = labeled_knob(
             am_row, 'Move Speed', 1, 100, 30,
-            '#ff9966', C_PANEL, self._on_am_speed)
+            '#ff9966', C_BG, self._on_am_speed)
         self._am_speed_knob.master.pack(side='right', padx=(0, 4))
 
-        # ── ポインタデザイン 選択行 ──────────────────
+        # POINTER デザイン選択行
         tk.Frame(f, bg='#2a2a4a', height=1).pack(fill='x', pady=(8, 5))
-        sat_row = tk.Frame(f, bg=C_PANEL)
+        sat_row = tk.Frame(f, bg=C_BG)
         sat_row.pack(fill='x', pady=(0, 4))
-        tk.Label(sat_row, text='POINTER', bg=C_PANEL, fg='#445566',
+        tk.Label(sat_row, text='POINTER', bg=C_BG, fg='#445566',
                  font=('Helvetica', 7)).pack(side='left', padx=(0, 4))
         self._sat_type_btns = {}
         for key, label in [('sputnik1', 'SP-1'), ('sputnik3', 'SP-3'),
@@ -2458,6 +2473,439 @@ class AmbientApp:
             btn.pack(side='left', padx=1)
             self._sat_type_btns[key] = btn
         self._update_sat_type_buttons('sputnik1')
+
+        f.pack()
+
+    def _build_drone_panel(self, parent):
+        BG = '#141428'
+        f = section(parent, 'Drone')
+        f.pack(fill='x', pady=(0, 6))
+        block = tk.Frame(f, bg=BG, padx=10, pady=8)
+        block.pack(fill='x', pady=3)
+
+        header = tk.Frame(block, bg=BG)
+        header.pack(fill='x', pady=(0, 6))
+        lvar, _pb = pwr_btn(header, 'DRONE', BG, initial=True,
+                            fg_on=C_TEXT, fg_off='#555577',
+                            command=lambda: self._on_layer('drone'))
+        self._layer_vars['drone'] = lvar
+        _pb.pack(side='left')
+        tk.Label(header, text='Ch.1', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+        lamp = tk.Label(header, text='●', bg=BG, fg='#2a2a4a',
+                        font=('Helvetica', 10))
+        lamp.pack(side='left', padx=(5, 0))
+        _lamp_fns[0] = lambda on, w=lamp: w.config(fg='#00c896' if on else '#2a2a4a')
+
+        knob_row = tk.Frame(block, bg=BG)
+        knob_row.pack()
+        _, kv = labeled_knob(knob_row, 'Vel', 1, 127, 45,
+                              C_TEXT, BG, lambda v: self._on_vel('drone', v))
+        kv.master.pack(side='left', padx=10)
+        var_f, kvar = labeled_knob(knob_row, 'Variation', 0, 100, 20,
+                                    C_VAR, BG, lambda v: self._on_variation('drone', v))
+        rnd_var_btn = tk.Label(var_f, text='RND', bg=BG, fg='#4a9eff', relief='flat',
+                               font=('Helvetica', 6, 'bold'), padx=3, pady=1, cursor='hand2')
+        rnd_var_btn.bind('<Button-1>', lambda e: self._on_variation_random('drone'))
+        rnd_var_btn.pack()
+        self._var_rand_btns['drone'] = rnd_var_btn
+        self._var_knobs['drone'] = kvar
+        var_f.pack(side='left', padx=10)
+        _, krest = labeled_knob(knob_row, 'Rest', 0, 100, 0,
+                                 C_REST, BG, lambda v: self._on_rest('drone', v))
+        krest.master.pack(side='left', padx=10)
+
+        oct_row = tk.Frame(block, bg=BG)
+        oct_row.pack(fill='x', pady=(6, 0))
+        tk.Label(oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._drone_oct_btns = {}
+        for ov in [1, 2, 3, 4, 5]:
+            btn = tk.Label(oct_row, text=str(ov), width=3,
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 9), pady=3, cursor='hand2')
+            btn.bind('<Button-1>', lambda e, v=ov: self._on_drone_octave(v))
+            btn.pack(side='left', padx=1)
+            self._drone_oct_btns[ov] = btn
+        self._update_drone_oct_buttons(3)
+
+        follow_row = tk.Frame(block, bg=BG)
+        follow_row.pack(fill='x', pady=(4, 0))
+        tk.Label(follow_row, text='Follow', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._drone_follow_btns = {}
+        for fkey, flabel in [('root', 'ROOT'), ('chord', 'CHORD')]:
+            b = tk.Label(follow_row, text=flabel, width=6,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, k=fkey: self._on_drone_follow(k))
+            b.pack(side='left', padx=1)
+            self._drone_follow_btns[fkey] = b
+        self._update_drone_follow_buttons('root')
+
+    def _build_melody_panel(self, parent):
+        BG = '#141428'
+        f = section(parent, 'Melody')
+        f.pack(fill='x', pady=(0, 6))
+        block = tk.Frame(f, bg=BG, padx=10, pady=8)
+        block.pack(fill='x', pady=3)
+
+        header = tk.Frame(block, bg=BG)
+        header.pack(fill='x', pady=(0, 6))
+        lvar, _pb = pwr_btn(header, 'MELODY', BG, initial=True,
+                            fg_on=C_TEXT, fg_off='#555577',
+                            command=lambda: self._on_layer('melody'))
+        self._layer_vars['melody'] = lvar
+        _pb.pack(side='left')
+        tk.Label(header, text='Ch.2', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+        lamp = tk.Label(header, text='●', bg=BG, fg='#2a2a4a',
+                        font=('Helvetica', 10))
+        lamp.pack(side='left', padx=(5, 0))
+        _lamp_fns[1] = lambda on, w=lamp: w.config(fg='#00c896' if on else '#2a2a4a')
+
+        knob_row = tk.Frame(block, bg=BG)
+        knob_row.pack()
+        _, kv = labeled_knob(knob_row, 'Vel', 1, 127, 38,
+                              C_TEXT, BG, lambda v: self._on_vel('melody', v))
+        kv.master.pack(side='left', padx=10)
+        var_f, kvar = labeled_knob(knob_row, 'Variation', 0, 100, 30,
+                                    C_VAR, BG, lambda v: self._on_variation('melody', v))
+        rnd_var_btn = tk.Label(var_f, text='RND', bg=BG, fg='#4a9eff', relief='flat',
+                               font=('Helvetica', 6, 'bold'), padx=3, pady=1, cursor='hand2')
+        rnd_var_btn.bind('<Button-1>', lambda e: self._on_variation_random('melody'))
+        rnd_var_btn.pack()
+        self._var_rand_btns['melody'] = rnd_var_btn
+        self._var_knobs['melody'] = kvar
+        var_f.pack(side='left', padx=10)
+        _, krest = labeled_knob(knob_row, 'Rest', 0, 100, 35,
+                                 C_REST, BG, lambda v: self._on_rest('melody', v))
+        krest.master.pack(side='left', padx=10)
+
+        oct_row = tk.Frame(block, bg=BG)
+        oct_row.pack(fill='x', pady=(6, 0))
+        tk.Label(oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._melody_oct_btns = {}
+        for ov in [1, 2, 3, 4, 5]:
+            b = tk.Label(oct_row, text=str(ov), width=3,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 9), pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=ov: self._on_melody_octave(v))
+            b.pack(side='left', padx=1)
+            self._melody_oct_btns[ov] = b
+        self._update_melody_oct_buttons(1)
+
+        rng_row = tk.Frame(block, bg=BG)
+        rng_row.pack(fill='x', pady=(4, 0))
+        tk.Label(rng_row, text='Range', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._melody_range_btns = {}
+        _rng_labels = {1: '1oct', 2: '2oct', 3: '3oct'}
+        for rv in [1, 2, 3]:
+            b = tk.Label(rng_row, text=_rng_labels[rv],
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), padx=6, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=rv: self._on_melody_range(v))
+            b.pack(side='left', padx=1)
+            self._melody_range_btns[rv] = b
+        self._update_melody_range_buttons(1)
+
+        char_row = tk.Frame(block, bg=BG)
+        char_row.pack(fill='x', pady=(4, 0))
+        tk.Label(char_row, text='Char', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._melody_char_btns = {}
+        for ckey, clabel, ccol in [
+            ('contour', 'Contour',  '#69db7c'),
+            ('phrase',  'Phrase',   '#4dabf7'),
+            ('motif',   'Motif',    '#ffa94d'),
+            ('chord',   'ChordOnly','#f783ac'),
+            ('simple',  'Simple',   '#a9e34b'),
+        ]:
+            b = tk.Label(char_row, text=clabel,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), padx=6, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, k=ckey: self._on_melody_character(k))
+            b.pack(side='left', padx=1)
+            self._melody_char_btns[ckey] = (b, ccol)
+
+        rhy_row = tk.Frame(block, bg=BG)
+        rhy_row.pack(fill='x', pady=(4, 0))
+        tk.Label(rhy_row, text='Rhythm', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._melody_rhythm_btns = {}
+        for rkey, rlabel, rcol in [
+            ('free',    'Free',    '#555577'),
+            ('flowing', 'Flowing', '#69db7c'),
+            ('dotted',  'Dotted',  '#4dabf7'),
+            ('synco',   'Synco',   '#ffa94d'),
+            ('staccato','Staccato','#ff6b6b'),
+            ('breath',  'Breath',  '#da77f2'),
+        ]:
+            b = tk.Label(rhy_row, text=rlabel,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 7), padx=4, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, k=rkey: self._on_melody_rhythm(k))
+            b.pack(side='left', padx=1)
+            self._melody_rhythm_btns[rkey] = (b, rcol)
+        self._update_melody_rhythm_buttons('free')
+
+        spd_row = tk.Frame(block, bg=BG)
+        spd_row.pack(fill='x', pady=(4, 0))
+        tk.Label(spd_row, text='Speed', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._melody_speed_btns = {}
+        for lbl_text, val in [('/16', 0.0625), ('/8', 0.125), ('/4', 0.25),
+                               ('/2', 0.5), ('×1', 1.0), ('×2', 2.0), ('×4', 4.0)]:
+            b = tk.Label(spd_row, text=lbl_text,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=val: self._on_melody_speed(v))
+            b.pack(side='left', padx=1)
+            self._melody_speed_btns[val] = b
+        self._melody_speed_rand_btn = tk.Label(
+            spd_row, text='RAND', bg='#1e1e38', fg='#4a9eff', relief='flat',
+            font=('Helvetica', 8, 'bold'), padx=6, pady=3, cursor='hand2')
+        self._melody_speed_rand_btn.bind('<Button-1>', lambda e: self._on_melody_speed_random())
+        self._melody_speed_rand_btn.pack(side='left', padx=(6, 0))
+        self._update_melody_speed_buttons(1.0)
+
+    def _build_sparkle_panel(self, parent):
+        BG = '#141428'
+        f = section(parent, 'Sparkle')
+        f.pack(fill='x', pady=(0, 6))
+        block = tk.Frame(f, bg=BG, padx=10, pady=8)
+        block.pack(fill='x', pady=3)
+
+        header = tk.Frame(block, bg=BG)
+        header.pack(fill='x', pady=(0, 6))
+        lvar, _pb = pwr_btn(header, 'SPARKLE', BG, initial=True,
+                            fg_on=C_TEXT, fg_off='#555577',
+                            command=lambda: self._on_layer('sparkle'))
+        self._layer_vars['sparkle'] = lvar
+        _pb.pack(side='left')
+        tk.Label(header, text='Ch.3', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+        lamp = tk.Label(header, text='●', bg=BG, fg='#2a2a4a',
+                        font=('Helvetica', 10))
+        lamp.pack(side='left', padx=(5, 0))
+        _lamp_fns[2] = lambda on, w=lamp: w.config(fg='#00c896' if on else '#2a2a4a')
+
+        knob_row = tk.Frame(block, bg=BG)
+        knob_row.pack()
+        _, kv = labeled_knob(knob_row, 'Vel', 1, 127, 28,
+                              C_TEXT, BG, lambda v: self._on_vel('sparkle', v))
+        kv.master.pack(side='left', padx=10)
+        var_f, kvar = labeled_knob(knob_row, 'Variation', 0, 100, 60,
+                                    C_VAR, BG, lambda v: self._on_variation('sparkle', v))
+        rnd_var_btn = tk.Label(var_f, text='RND', bg=BG, fg='#4a9eff', relief='flat',
+                               font=('Helvetica', 6, 'bold'), padx=3, pady=1, cursor='hand2')
+        rnd_var_btn.bind('<Button-1>', lambda e: self._on_variation_random('sparkle'))
+        rnd_var_btn.pack()
+        self._var_rand_btns['sparkle'] = rnd_var_btn
+        self._var_knobs['sparkle'] = kvar
+        var_f.pack(side='left', padx=10)
+        _, krest = labeled_knob(knob_row, 'Rest', 0, 100, 60,
+                                 C_REST, BG, lambda v: self._on_rest('sparkle', v))
+        krest.master.pack(side='left', padx=10)
+
+        sp_oct_row = tk.Frame(block, bg=BG)
+        sp_oct_row.pack(fill='x', pady=(6, 0))
+        tk.Label(sp_oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._sparkle_oct_btns = {}
+        for ov in [1, 2, 3, 4, 5]:
+            b = tk.Label(sp_oct_row, text=str(ov), width=3,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 9), pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=ov: self._on_sparkle_octave(v))
+            b.pack(side='left', padx=1)
+            self._sparkle_oct_btns[ov] = b
+        self._update_sparkle_oct_buttons(3)
+
+        sp_rng_row = tk.Frame(block, bg=BG)
+        sp_rng_row.pack(fill='x', pady=(4, 0))
+        tk.Label(sp_rng_row, text='Range', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._sparkle_range_btns = {}
+        for rv, rl in [(1, '1oct'), (2, '2oct'), (3, '3oct')]:
+            b = tk.Label(sp_rng_row, text=rl,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), padx=6, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=rv: self._on_sparkle_range(v))
+            b.pack(side='left', padx=1)
+            self._sparkle_range_btns[rv] = b
+        self._update_sparkle_range_buttons(1)
+
+    def _build_chord_panel(self, parent):
+        C_CHORD = '#7ecfe0'
+        BG = '#141428'
+        f = section(parent, 'Chord / Arp')
+        f.pack(fill='x', pady=(0, 6))
+        block = tk.Frame(f, bg=BG, padx=10, pady=8)
+        block.pack(fill='x', pady=3)
+
+        header = tk.Frame(block, bg=BG)
+        header.pack(fill='x', pady=(0, 6))
+        lvar, _pb = pwr_btn(header, 'CHORD', BG, initial=True,
+                            fg_on='#7ecfe0', fg_off='#555577',
+                            command=lambda: self._on_layer('chord'))
+        self._layer_vars['chord'] = lvar
+        _pb.pack(side='left')
+        tk.Label(header, text='Ch.4', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(6, 0))
+        chord_lamp = tk.Label(header, text='●', bg=BG, fg='#2a2a4a',
+                              font=('Helvetica', 10))
+        chord_lamp.pack(side='left', padx=(5, 0))
+        _lamp_fns[3] = lambda on, w=chord_lamp: w.config(fg='#00c896' if on else '#2a2a4a')
+
+        chord_knob_row = tk.Frame(block, bg=BG)
+        chord_knob_row.pack(fill='x', pady=(0, 6))
+        _, self._chord_vel_knob = labeled_knob(
+            chord_knob_row, 'Vel', 1, 127, 55,
+            C_CHORD, BG, lambda v: self._on_vel('chord', v))
+        self._chord_vel_knob.master.pack(side='left', padx=6)
+        _, self._chord_rest_knob = labeled_knob(
+            chord_knob_row, 'Rest %', 0, 100, 20,
+            C_REST, BG, lambda v: self._on_rest('chord', v))
+        self._chord_rest_knob.master.pack(side='left', padx=6)
+
+        arp_row = tk.Frame(block, bg=BG)
+        arp_row.pack(fill='x', pady=(0, 4))
+        self._arp_var, _pb = pwr_btn(arp_row, 'ARP', BG, initial=True,
+                                     fg_on=C_CHORD, fg_off='#555577',
+                                     command=self._on_arp_on)
+        _pb.pack(side='left')
+        self._arp_mode_var = tk.StringVar(value='up')
+        arp_mode_cb = ttk.Combobox(arp_row, textvariable=self._arp_mode_var,
+                                   values=['up', 'down', 'zigzag', 'random'],
+                                   state='readonly', width=8)
+        arp_mode_cb.pack(side='left', padx=(8, 0))
+        arp_mode_cb.bind('<<ComboboxSelected>>', self._on_arp_mode)
+
+        rate_row = tk.Frame(block, bg=BG)
+        rate_row.pack(fill='x', pady=(0, 2))
+        tk.Label(rate_row, text='Rate', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 4))
+        self._arp_rate_btns = {}
+        for label, val in ARP_RATES:
+            lbl = tk.Label(rate_row, text=label,
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=val: self._on_arp_rate_btn(v))
+            lbl.pack(side='left', padx=1)
+            self._arp_rate_btns[val] = lbl
+        self._arp_rand_var = tk.BooleanVar(value=False)
+        self._arp_rand_btn = tk.Label(rate_row, text='RAND',
+                                      bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                      font=('Helvetica', 8, 'bold'), padx=6, pady=3,
+                                      cursor='hand2')
+        self._arp_rand_btn.bind('<Button-1>', lambda e: self._on_arp_rate_random())
+        self._arp_rand_btn.pack(side='left', padx=(6, 0))
+        self._update_arp_rate_buttons(0.25)
+
+        swing_row = tk.Frame(block, bg=BG)
+        swing_row.pack(fill='x', pady=(2, 2))
+        tk.Label(swing_row, text='Swing', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+        self._swing_btns = {}
+        for lbl_text, val in [('Str', 0.50), ('Soft', 0.58), ('Trip', 0.67), ('Hard', 0.75)]:
+            b = tk.Label(swing_row, text=lbl_text,
+                         bg='#1e1e38', fg='#4a9eff', relief='flat',
+                         font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+            b.bind('<Button-1>', lambda e, v=val: self._on_arp_swing(v))
+            b.pack(side='left', padx=1)
+            self._swing_btns[val] = b
+        self._update_swing_buttons(0.50)
+
+        auto_row = tk.Frame(block, bg=BG)
+        auto_row.pack(fill='x', pady=(2, 4))
+        self._arp_auto_var = tk.BooleanVar(value=False)
+        self._arp_auto_btn = tk.Label(auto_row, text='AUTO RANDOM',
+                                      bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                      font=('Helvetica', 9, 'bold'), padx=8, pady=3,
+                                      cursor='hand2')
+        self._arp_auto_btn.bind('<Button-1>', lambda e: self._on_arp_auto())
+        self._arp_auto_btn.pack(side='left')
+        tk.Label(auto_row, text='毎', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(8, 2))
+        self._arp_auto_bar_btns = {}
+        for b in [1, 2, 4, 8, 16]:
+            lbl = tk.Label(auto_row, text=str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_arp_auto_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._arp_auto_bar_btns[b] = lbl
+        tk.Label(auto_row, text='小節', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._update_bar_buttons(self._arp_auto_bar_btns, 4)
+
+        oct_row = tk.Frame(block, bg=BG)
+        oct_row.pack(fill='x', pady=(0, 4))
+        tk.Label(oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left')
+        self._chord_oct_var = tk.IntVar(value=1)
+        for o in [1, 2, 3]:
+            tk.Radiobutton(oct_row, text=str(o), variable=self._chord_oct_var, value=o,
+                           bg=BG, fg=C_TEXT, selectcolor=C_ACCENT,
+                           activebackground=BG,
+                           command=self._on_chord_octave).pack(side='left', padx=3)
+        tk.Label(oct_row, text='  Range', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(8, 0))
+        self._chord_oct_range_var = tk.IntVar(value=1)
+        for r in [1, 2, 3]:
+            tk.Radiobutton(oct_row, text=str(r), variable=self._chord_oct_range_var, value=r,
+                           bg=BG, fg=C_TEXT, selectcolor=C_ACCENT,
+                           activebackground=BG,
+                           command=self._on_chord_oct_range).pack(side='left', padx=3)
+
+        restbar_row = tk.Frame(block, bg=BG)
+        restbar_row.pack(fill='x', pady=(4, 0))
+        tk.Label(restbar_row, text='Rest len', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(0, 4))
+        self._chord_rest_bar_btns = {}
+        for b in [0, 1, 2, 4, 8, 16]:
+            lbl = tk.Label(restbar_row, text='なし' if b == 0 else str(b),
+                           bg='#1e1e38', fg='#4a9eff', relief='flat',
+                           font=('Helvetica', 8), padx=5, pady=3, cursor='hand2')
+            lbl.bind('<Button-1>', lambda e, v=b: self._on_chord_rest_bars(v))
+            lbl.pack(side='left', padx=1)
+            self._chord_rest_bar_btns[b] = lbl
+        tk.Label(restbar_row, text='小節', bg=BG, fg=C_MUTED,
+                 font=('Helvetica', 8)).pack(side='left', padx=(2, 0))
+        self._chord_rest_rand_var = tk.BooleanVar(value=False)
+        self._chord_rest_rand_btn = tk.Label(restbar_row, text='RAND',
+                                             bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                             font=('Helvetica', 8, 'bold'), padx=6, pady=3,
+                                             cursor='hand2')
+        self._chord_rest_rand_btn.bind('<Button-1>', lambda e: self._on_chord_rest_bars_random())
+        self._chord_rest_rand_btn.pack(side='left', padx=(6, 0))
+        self._update_bar_buttons(self._chord_rest_bar_btns, 4)
+
+    def _draw_radial_bg(self, mc, cx, cy):
+        """凱旋門広場の放射状デコレーションを描画"""
+        import math
+        W = mc.winfo_width()
+        H = mc.winfo_height()
+        if W < 10:
+            self.root.after(100, lambda: self._draw_radial_bg(mc, cx, cy))
+            return
+        R = max(W, H)
+        # 8本のアベニュー線
+        for i in range(8):
+            angle = i * math.pi / 4
+            ex = cx + math.cos(angle) * R
+            ey = cy + math.sin(angle) * R
+            mc.create_line(cx, cy, ex, ey,
+                           fill='#181830', width=2, tags='bg_deco')
+        # 外側の環状道路
+        for r, col in [(175, '#212140'), (140, '#1c1c38'), (108, '#191934')]:
+            mc.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           outline=col, width=1, tags='bg_deco')
+        # デコレーションを最背面へ
+        mc.tag_lower('bg_deco')
 
     def _build_layers(self, parent):
         f = section(parent, 'Layers')
