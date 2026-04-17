@@ -577,7 +577,6 @@ class DroneLayer:
                     if 0 <= n <= 127:
                         midi_on(self.ch, n, vel)
                 names = [NOTE_NAMES[n % 12] for n in base_notes]
-                self.log(f"Drone   {names}  vel={vel}  var={int(var*100)}%")
 
             # 0.1秒刻みでポーリング：期限切れpendingをoff、ルート変化を検知
             while self._running:
@@ -849,8 +848,6 @@ class MelodyLayer:
                 if random.random() < rest_prob:
                     self._interruptible_sleep(4.0 * one_beat)
                 else:
-                    name = NOTE_NAMES[note % 12]
-                    self.log(f"{self.label}  {name}{note//12-1}  vel={vel}  [simple]")
                     midi_on(self.ch, note, vel)
                     self._interruptible_sleep(3.0 * one_beat)
                     midi_off(self.ch, note)
@@ -861,9 +858,6 @@ class MelodyLayer:
                 self._interruptible_sleep(dur_s)
                 continue
 
-            name = NOTE_NAMES[note % 12]
-            self.log(f"{self.label}  {name}{note//12-1}  "
-                     f"vel={vel}  var={int(var*100)}%  rest={int(rest_prob*100)}%")
             midi_on(self.ch, note, vel)
             self._interruptible_sleep(dur_s * self.gate)
             midi_off(self.ch, note)
@@ -1153,7 +1147,6 @@ class ChordLayer:
                     next_cycle_t = now
 
                 names = [NOTE_NAMES[n % 12] for n in notes]
-                self.log(f"Chord   {names}  [{arp_mode}]  {arp_rate:.2f}beat  swing={int((swing-0.5)*200)}%")
 
                 # サイクル開始まで待機してから t0 を確定
                 self._sleep_until(next_cycle_t)
@@ -1186,7 +1179,6 @@ class ChordLayer:
             else:
                 names = [NOTE_NAMES[n % 12] for n in notes]
                 dur   = wchoice({4.0: 2, 8.0: 3, 16.0: 1})
-                self.log(f"Chord   {names}  [block]  {dur}拍")
                 self._sleep_until(next_cycle_t)
                 t0 = time.perf_counter()
                 for note in notes:
