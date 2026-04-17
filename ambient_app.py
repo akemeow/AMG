@@ -2426,6 +2426,23 @@ class AmbientApp:
         mod_col.pack(side='left', padx=(0, 6))
         tk.Label(mod_col, text='MOD', bg=C_BG, fg='#6677aa',
                  font=('Helvetica', 7, 'bold')).pack(pady=(0, 2))
+
+        # チャンネル選択ボタン（1〜4）
+        self._mod_ch_active = {0: True, 1: True, 2: True, 3: True}
+        self._mod_ch_btns = {}
+        ch_row = tk.Frame(mod_col, bg=C_BG)
+        ch_row.pack(pady=(0, 3))
+        _ch_labels = {0: '1', 1: '2', 2: '3', 3: '4'}
+        for ch in range(4):
+            b = tk.Label(ch_row, text=_ch_labels[ch],
+                         bg='#2a2a5a', fg='#7c8fdd',
+                         font=('Helvetica', 7, 'bold'),
+                         width=2, pady=1, cursor='hand2',
+                         relief='flat')
+            b.bind('<Button-1>', lambda e, c=ch: self._on_mod_ch_toggle(c))
+            b.pack(side='left', padx=1)
+            self._mod_ch_btns[ch] = b
+
         self._mod_wheel_var = tk.IntVar(value=0)
         self._mod_wheel = tk.Scale(
             mod_col,
@@ -3550,16 +3567,27 @@ class AmbientApp:
             STATE.evolve_speed = x
             STATE.evolve_depth = y
 
+    def _on_mod_ch_toggle(self, ch):
+        active = not self._mod_ch_active[ch]
+        self._mod_ch_active[ch] = active
+        btn = self._mod_ch_btns[ch]
+        if active:
+            btn.config(bg='#2a2a5a', fg='#7c8fdd')
+        else:
+            btn.config(bg='#111120', fg='#333355')
+        # 即座に現在値を再送
+        self._on_mod_wheel(self._mod_wheel_var.get())
+
     def _on_mod_wheel(self, val):
         v = int(val)
-        # 表示を更新
         if hasattr(self, '_mod_val_lbl'):
             self._mod_val_lbl.config(text=str(v))
-        # CC#1 を全チャンネル（0-3）へ送信
+        # アクティブなチャンネルのみ CC#1 を送信
         try:
             midi = get_midi()
-            for ch in range(4):
-                midi.send_message([0xB0 | ch, 1, v])
+            for ch, active in self._mod_ch_active.items():
+                if active:
+                    midi.send_message([0xB0 | ch, 1, v])
         except Exception:
             pass
 
