@@ -2098,18 +2098,38 @@ class AmbientApp:
 
         CX, CY = 700, 440   # 凱旋門（中央ハブ）座標
 
-        def pw(frame, x, y, anchor='center'):
+        # 浮遊アニメーション用パネルリスト（中央ハブは登録しない）
+        self._float_panels = []
+
+        def pw_fixed(frame, x, y, anchor='center'):
+            """浮遊しない固定パネル（中央ハブ用）"""
             mc.create_window(x, y, window=frame, anchor=anchor)
+
+        def pw(frame, x, y, anchor='center', amp=None, speed=None):
+            """浮遊するパネル"""
+            item_id = mc.create_window(x, y, window=frame, anchor=anchor)
+            _amp   = amp   if amp   is not None else random.uniform(7.0, 13.0)
+            _speed = speed if speed is not None else random.uniform(0.35, 0.65)
+            _phase = random.uniform(0, 2 * math.pi)
+            self._float_panels.append({
+                'item_id': item_id,
+                'frame':   frame,
+                'base_x':  float(x),
+                'base_y':  float(y),
+                'phase':   _phase,
+                'speed':   _speed,
+                'amp':     _amp,
+            })
 
         # コントロール辞書を初期化
         self._layer_vars    = {}
         self._var_rand_btns = {}
         self._var_knobs     = {}
 
-        # ── 中央ハブ（KaossPad + AUTO EVOLVE + AUTO MOD）────────────
+        # ── 中央ハブ（KaossPad + AUTO EVOLVE + AUTO MOD）── 固定
         hub = tk.Frame(mc, bg=C_BG)
         self._build_kaoss_hub(hub)
-        pw(hub, CX, CY)
+        pw_fixed(hub, CX, CY)
 
         # ── N: Transport ─────────────────────────────────────────────
         f_tr = tk.Frame(mc, bg=C_BG)
@@ -2155,6 +2175,9 @@ class AmbientApp:
 
         # ── 放射状デコレーションを描画 ───────────────────────────────
         self.root.after(150, lambda: self._draw_radial_bg(mc, CX, CY))
+
+        # 浮遊アニメーション開始
+        self.root.after(200, self._float_tick)
 
         # BPM ブリンク開始
         self.root.after(100, self._bpm_blink_tick)
@@ -2942,6 +2965,46 @@ class AmbientApp:
                            outline=col, width=1, tags='bg_deco')
         # デコレーションを最背面へ
         mc.tag_lower('bg_deco')
+
+    def _float_tick(self):
+        """周囲パネルをサイン波で浮遊させる。ホバー中はベース位置へイーズバック。"""
+        import time as _time
+        t = _time.time()
+
+        # カーソル下のウィジェットを取得
+        try:
+            wx = self.root.winfo_pointerx()
+            wy = self.root.winfo_pointery()
+            widget_under = self.root.winfo_containing(wx, wy)
+        except Exception:
+            widget_under = None
+
+        mc = self._radial_canvas
+        for p in self._float_panels:
+            # ウィジェット階層を辿ってホバー判定
+            hovered = False
+            w = widget_under
+            while w is not None:
+                if w is p['frame']:
+                    hovered = True
+                    break
+                w = getattr(w, 'master', None)
+
+            try:
+                cx, cy = mc.coords(p['item_id'])
+            except Exception:
+                continue
+
+            if hovered:
+                # ベース位置へゆっくりイーズバック
+                new_y = cy + (p['base_y'] - cy) * 0.12
+                mc.coords(p['item_id'], p['base_x'], new_y)
+            else:
+                # サイン波で浮遊
+                dy = p['amp'] * math.sin(t * p['speed'] + p['phase'])
+                mc.coords(p['item_id'], p['base_x'], p['base_y'] + dy)
+
+        self.root.after(30, self._float_tick)
 
     def _build_layers(self, parent):
         f = section(parent, 'Layers')
