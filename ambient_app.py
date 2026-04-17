@@ -2118,8 +2118,9 @@ class AmbientApp:
             _phase_x = random.uniform(0, 2 * math.pi)
 
             # クリックで最前面に（子ウィジェットへ再帰バインド）
-            def _raise(e=None, _id=item_id):
-                mc.tag_raise(_id)
+            def _raise(e=None, _id=item_id, _f=frame):
+                _f.lift()          # 埋め込みウィンドウを最前面へ
+                mc.tag_raise(_id)  # canvas アイテム順も更新
             def _bind_raise(w):
                 w.bind('<Button-1>', _raise, add='+')
                 for child in w.winfo_children():
