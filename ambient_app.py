@@ -2106,19 +2106,23 @@ class AmbientApp:
             mc.create_window(x, y, window=frame, anchor=anchor)
 
         def pw(frame, x, y, anchor='center', amp=None, speed=None):
-            """浮遊するパネル"""
+            """浮遊するパネル（X・Y 独立サイン波、無重力ドリフト）"""
             item_id = mc.create_window(x, y, window=frame, anchor=anchor)
-            _amp   = amp   if amp   is not None else random.uniform(7.0, 13.0)
-            _speed = speed if speed is not None else random.uniform(0.35, 0.65)
-            _phase = random.uniform(0, 2 * math.pi)
+            # Y 軸
+            _amp_y   = amp   if amp   is not None else random.uniform(7.0, 13.0)
+            _speed_y = speed if speed is not None else random.uniform(0.35, 0.60)
+            _phase_y = random.uniform(0, 2 * math.pi)
+            # X 軸（Y と異なる速度・位相でリサージュ的な軌跡に）
+            _amp_x   = random.uniform(5.0, 10.0)
+            _speed_x = _speed_y * random.uniform(0.55, 0.80)  # Y より遅め
+            _phase_x = random.uniform(0, 2 * math.pi)
             self._float_panels.append({
                 'item_id': item_id,
                 'frame':   frame,
                 'base_x':  float(x),
                 'base_y':  float(y),
-                'phase':   _phase,
-                'speed':   _speed,
-                'amp':     _amp,
+                'phase_y': _phase_y,  'speed_y': _speed_y,  'amp_y': _amp_y,
+                'phase_x': _phase_x,  'speed_x': _speed_x,  'amp_x': _amp_x,
             })
 
         # コントロール辞書を初期化
@@ -2996,13 +3000,15 @@ class AmbientApp:
                 continue
 
             if hovered:
-                # ベース位置へゆっくりイーズバック
+                # ベース位置へゆっくりイーズバック（X・Y 両軸）
+                new_x = cx + (p['base_x'] - cx) * 0.12
                 new_y = cy + (p['base_y'] - cy) * 0.12
-                mc.coords(p['item_id'], p['base_x'], new_y)
+                mc.coords(p['item_id'], new_x, new_y)
             else:
-                # サイン波で浮遊
-                dy = p['amp'] * math.sin(t * p['speed'] + p['phase'])
-                mc.coords(p['item_id'], p['base_x'], p['base_y'] + dy)
+                # X・Y 独立サイン波で無重力ドリフト
+                dx = p['amp_x'] * math.sin(t * p['speed_x'] + p['phase_x'])
+                dy = p['amp_y'] * math.sin(t * p['speed_y'] + p['phase_y'])
+                mc.coords(p['item_id'], p['base_x'] + dx, p['base_y'] + dy)
 
         self.root.after(30, self._float_tick)
 
