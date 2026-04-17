@@ -183,6 +183,8 @@ class GlobalState:
         self.melody_speed_random  = False  # Trueのとき自動ランダム切り替え
         self.melody_speed_rand_min = 0.25  # ランダム範囲 下限
         self.melody_speed_rand_max = 4.0   # ランダム範囲 上限
+        self.sparkle_octave       = 3      # スパークル基準オクターブ (1〜5)
+        self.sparkle_range        = 1      # スパークル音域レンジ（1〜3）
         self.melody_octave        = 1      # 基準オクターブ (1〜5)
         self.melody_range         = 1      # 音域レンジ（オクターブ数 1〜3）
         self.melody_character     = []     # 'contour','phrase','motif' の組み合わせ
@@ -258,6 +260,8 @@ class GlobalState:
                 melody_speed_random    = self.melody_speed_random,
                 melody_speed_rand_min  = self.melody_speed_rand_min,
                 melody_speed_rand_max  = self.melody_speed_rand_max,
+                sparkle_octave         = self.sparkle_octave,
+                sparkle_range          = self.sparkle_range,
                 melody_octave          = self.melody_octave,
                 melody_range           = self.melody_range,
                 melody_character       = list(self.melody_character),
@@ -798,10 +802,13 @@ class MelodyLayer:
             var       = s['variation'][key]
             rest_prob = s['rest_prob'][key]
 
-            # melody レイヤーは STATE からオクターブ・レンジを取得、他は固定
+            # melody / sparkle は STATE からオクターブ・レンジを取得、他は固定
             if self.layer_key == 'melody':
                 base_oct = s['melody_octave']
                 n_range  = s['melody_range']
+            elif self.layer_key == 'sparkle':
+                base_oct = s['sparkle_octave']
+                n_range  = s['sparkle_range']
             else:
                 base_oct = self.octave
                 n_range  = 1
@@ -2508,6 +2515,37 @@ class AmbientApp:
                                      C_REST, BG, lambda v, k=key: self._on_rest(k, v))
             krest.master.pack(side='left', padx=10)
 
+            # Sparkle: Octave + Range セレクター
+            if key == 'sparkle':
+                sp_oct_row = tk.Frame(block, bg=BG)
+                sp_oct_row.pack(fill='x', pady=(6, 0))
+                tk.Label(sp_oct_row, text='Oct', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._sparkle_oct_btns = {}
+                _sp_oct_colors = {1:'#a9e4ff', 2:'#4dabf7', 3:'#69db7c', 4:'#ffa94d', 5:'#ff6b6b'}
+                for ov in [1, 2, 3, 4, 5]:
+                    b = tk.Label(sp_oct_row, text=str(ov), width=3,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 9), pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, v=ov: self._on_sparkle_octave(v))
+                    b.pack(side='left', padx=1)
+                    self._sparkle_oct_btns[ov] = b
+                self._update_sparkle_oct_buttons(3)
+
+                sp_rng_row = tk.Frame(block, bg=BG)
+                sp_rng_row.pack(fill='x', pady=(4, 0))
+                tk.Label(sp_rng_row, text='Range', bg=BG, fg=C_MUTED,
+                         font=('Helvetica', 8)).pack(side='left', padx=(0, 6))
+                self._sparkle_range_btns = {}
+                for rv, rl in [(1,'1oct'), (2,'2oct'), (3,'3oct')]:
+                    b = tk.Label(sp_rng_row, text=rl,
+                                 bg='#1e1e38', fg='#4a9eff', relief='flat',
+                                 font=('Helvetica', 8), padx=6, pady=3, cursor='hand2')
+                    b.bind('<Button-1>', lambda e, v=rv: self._on_sparkle_range(v))
+                    b.pack(side='left', padx=1)
+                    self._sparkle_range_btns[rv] = b
+                self._update_sparkle_range_buttons(1)
+
             # Melody のみ Octave / Range / Speed ボタンを追加
             if key == 'melody':
                 # Oct ボタン
@@ -2659,6 +2697,18 @@ class AmbientApp:
                               font=('Helvetica', 10))
         chord_lamp.pack(side='left', padx=(5, 0))
         _lamp_fns[3] = lambda on, w=chord_lamp: w.config(fg='#00c896' if on else '#2a2a4a')
+
+        # Vel + Rest ノブ行
+        chord_knob_row = tk.Frame(block, bg=BG)
+        chord_knob_row.pack(fill='x', pady=(0, 6))
+        _, self._chord_vel_knob = labeled_knob(
+            chord_knob_row, 'Vel', 1, 127, 55,
+            C_CHORD, BG, lambda v: self._on_vel('chord', v))
+        self._chord_vel_knob.master.pack(side='left', padx=6)
+        _, self._chord_rest_knob = labeled_knob(
+            chord_knob_row, 'Rest %', 0, 100, 20,
+            C_REST, BG, lambda v: self._on_rest('chord', v))
+        self._chord_rest_knob.master.pack(side='left', padx=6)
 
         # ARP ON/OFF + モード選択
         arp_row = tk.Frame(block, bg=BG)
@@ -3298,6 +3348,34 @@ class AmbientApp:
     def _update_melody_range_buttons(self, selected):
         colors = {1: '#69db7c', 2: '#ffa94d', 3: '#ff6b6b'}
         for rv, btn in self._melody_range_btns.items():
+            if rv == selected:
+                btn.config(bg=colors.get(rv, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 8, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff',
+                           font=('Helvetica', 8))
+
+    def _on_sparkle_octave(self, val):
+        with STATE._lock: STATE.sparkle_octave = val
+        self._update_sparkle_oct_buttons(val)
+
+    def _update_sparkle_oct_buttons(self, selected):
+        colors = {1:'#a9e4ff', 2:'#4dabf7', 3:'#69db7c', 4:'#ffa94d', 5:'#ff6b6b'}
+        for ov, btn in self._sparkle_oct_btns.items():
+            if ov == selected:
+                btn.config(bg=colors.get(ov, C_ON), fg='#0f0f1e',
+                           font=('Helvetica', 9, 'bold'))
+            else:
+                btn.config(bg='#1e1e38', fg='#4a9eff',
+                           font=('Helvetica', 9))
+
+    def _on_sparkle_range(self, val):
+        with STATE._lock: STATE.sparkle_range = val
+        self._update_sparkle_range_buttons(val)
+
+    def _update_sparkle_range_buttons(self, selected):
+        colors = {1:'#69db7c', 2:'#ffa94d', 3:'#ff6b6b'}
+        for rv, btn in self._sparkle_range_btns.items():
             if rv == selected:
                 btn.config(bg=colors.get(rv, C_ON), fg='#0f0f1e',
                            font=('Helvetica', 8, 'bold'))
