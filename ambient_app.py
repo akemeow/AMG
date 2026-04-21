@@ -371,7 +371,7 @@ class MidiClockSender:
 
 
 class MidiClockReceiver:
-    """Logic Pro から MIDI クロックを受信して BPM を同期する"""
+    """外部MIDIデバイス / DAW から MIDI クロックを受信して BPM を同期する"""
 
     def __init__(self, on_bpm_change):
         self._on_bpm_change = on_bpm_change
@@ -383,18 +383,46 @@ class MidiClockReceiver:
         self._ema_bpm   = None  # 指数移動平均BPM（内部用float）
         self._last_fired = None # 最後に通知したBPM整数値（ヒステリシス用）
 
-    def start(self, log_fn=None):
+    @staticmethod
+    def _fix_port_name(name):
+        """rtmidiがmac_romanで返すポート名をUTF-8に変換"""
+        try:
+            return name.encode('mac_roman').decode('utf-8')
+        except Exception:
+            return name
+
+    @staticmethod
+    def get_ports():
+        """利用可能な MIDI 入力ポート一覧を返す"""
+        try:
+            m = rtmidi.MidiIn()
+            ports = [MidiClockReceiver._fix_port_name(p) for p in m.get_ports()]
+            m.delete()
+            return ports
+        except Exception:
+            return []
+
+    def start(self, log_fn=None, port_idx=None):
+        """port_idx: None → 最初のIACを自動選択、int → 指定ポートを開く"""
         self._log = log_fn or print
         try:
             self._midi_in = rtmidi.MidiIn()
             ports = self._midi_in.get_ports()
             self._log(f"[SLAVE] MidiIn ports: {ports}")
-            iac = next((i for i, p in enumerate(ports) if 'IAC' in p), None)
-            if iac is None:
-                self._log("[SLAVE] IAC port not found!")
+            if not ports:
+                self._log("[SLAVE] MIDI入力ポートが見つかりません")
                 return False
-            self._midi_in.open_port(iac)
-            self._log(f"[SLAVE] Opened: {ports[iac]}")
+            if port_idx is not None:
+                idx = port_idx
+            else:
+                # フォールバック: IACを優先、なければ先頭ポート
+                iac = next((i for i, p in enumerate(ports) if 'IAC' in p), None)
+                idx = iac if iac is not None else 0
+            if idx >= len(ports):
+                self._log(f"[SLAVE] ポートindex {idx} は範囲外です")
+                return False
+            self._midi_in.open_port(idx)
+            self._log(f"[SLAVE] Opened: {ports[idx]}")
             self._midi_in.ignore_types(sysex=True, timing=False, active_sense=True)
             self._running = True
             self._midi_in.set_callback(self._callback)
@@ -478,23 +506,18 @@ def midi_on(ch, note, vel):
     if _midi_muted:
         return
     get_midi().send_message([0x90 | ch, note, max(1, min(127, int(vel)))])
-    if ch < 4 and ch in _lamp_fns and _lamp_root:
-        _lamp_notes[ch] += 1
-        if _lamp_notes[ch] == 1:   # 最初のノートオン → ランプ点灯
-            _lamp_root.after(0, lambda c=ch: _lamp_fns[c](True))
+    if ch < 4:
+        _lamp_notes[ch] += 1          # ランプは _lamp_tick() がポーリング更新
 
 def midi_off(ch, note):
     get_midi().send_message([0x80 | ch, note, 0])
-    if ch < 4 and ch in _lamp_fns and _lamp_root:
+    if ch < 4:
         _lamp_notes[ch] = max(0, _lamp_notes[ch] - 1)
-        if _lamp_notes[ch] == 0:   # 全ノートオフ → ランプ消灯
-            _lamp_root.after(0, lambda c=ch: _lamp_fns[c](False))
 
 def midi_all_off(ch):
     get_midi().send_message([0xB0 | ch, 123, 0])
-    if ch < 4 and ch in _lamp_fns and _lamp_root:
+    if ch < 4:
         _lamp_notes[ch] = 0
-        _lamp_root.after(0, lambda c=ch: _lamp_fns[c](False))
 
 def midi_panic():
     """全チャンネル即時消音"""
@@ -879,10 +902,11 @@ class MelodyLayer:
 
 
 class EvolutionController:
-    def __init__(self, log_fn):
-        self.log      = log_fn
-        self._running = False
-        self._phase   = 0.0
+    def __init__(self, log_fn, on_bpm_change=None):
+        self.log            = log_fn
+        self._on_bpm_change = on_bpm_change  # GUI BPMノブ更新コールバック
+        self._running       = False
+        self._phase         = 0.0
 
     def _loop(self):
         def _next(base, lo=0.6, hi=1.8):
@@ -1010,22 +1034,11 @@ class EvolutionController:
                     new_bpm = max(20, min(280, s['bpm'] + shift))
                     with STATE._lock: STATE.bpm = new_bpm
                     self.log(f"[EVOLVE] BPM → {new_bpm}")
+                    if self._on_bpm_change:
+                        self._on_bpm_change(new_bpm)
                     t_bpm = _next(base * 2.5)
 
-                # ⑨ レイヤー ON/OFF（depth > 0.65）
-                if depth > 0.65 and now >= t_layer:
-                    all_keys = ['drone', 'melody', 'sparkle', 'chord']
-                    k = random.choice(all_keys)
-                    with STATE._lock:
-                        cur_on = STATE.layers[k]
-                        # 最低2レイヤーは常時ON
-                        if cur_on and sum(STATE.layers.values()) > 2:
-                            STATE.layers[k] = False
-                            self.log(f"[EVOLVE] レイヤー {k.upper()} OFF")
-                        elif not cur_on:
-                            STATE.layers[k] = True
-                            self.log(f"[EVOLVE] レイヤー {k.upper()} ON")
-                    t_layer = _next(base * 2.0)
+                # ⑨ レイヤー ON/OFF は無効化（Auto Evolveではチャンネルを変更しない）
 
             time.sleep(0.1)
 
@@ -1245,8 +1258,8 @@ class KaossPad(tk.Canvas):
     ドラッグで値を変更し、command(x, y) を呼ぶ。
     auto_mod_start() / auto_mod_stop() でドット自動移動。
     """
-    W = 200
-    H = 160
+    W = 480
+    H = 270
 
     def __init__(self, parent, bg=C_PANEL, command=None, **kw):
         super().__init__(parent, width=self.W, height=self.H,
@@ -2102,8 +2115,16 @@ class AmbientApp:
         self._float_panels = []
 
         def pw_fixed(frame, x, y, anchor='center'):
-            """浮遊しない固定パネル（中央ハブ用）"""
-            mc.create_window(x, y, window=frame, anchor=anchor)
+            """浮遊しない固定パネル（中央ハブ用）— クリックで最前面"""
+            item_id = mc.create_window(x, y, window=frame, anchor=anchor)
+            def _raise(e=None, _id=item_id, _f=frame):
+                _f.lift()
+                mc.tag_raise(_id)
+            def _bind_raise(w):
+                w.bind('<Button-1>', _raise, add='+')
+                for child in w.winfo_children():
+                    _bind_raise(child)
+            _bind_raise(frame)
 
         def pw(frame, x, y, anchor='center', amp=None, speed=None):
             """浮遊するパネル（X・Y 独立サイン波、無重力ドリフト）"""
@@ -2166,7 +2187,7 @@ class AmbientApp:
         # ── SW: Drone Layer ──────────────────────────────────────────
         f_dn = tk.Frame(mc, bg=C_BG)
         self._build_drone_panel(f_dn)
-        pw(f_dn, 390, 710)
+        pw(f_dn, 210, 710)
 
         # ── S: Log ───────────────────────────────────────────────────
         f_lg = tk.Frame(mc, bg=C_BG)
@@ -2176,7 +2197,7 @@ class AmbientApp:
         # ── SE: Chord ARP ────────────────────────────────────────────
         f_ca = tk.Frame(mc, bg=C_BG)
         self._build_chord_panel(f_ca)
-        pw(f_ca, 1010, 710)
+        pw(f_ca, 1190, 710)
 
         # ── E: Melody Layer ──────────────────────────────────────────
         f_ml = tk.Frame(mc, bg=C_BG)
@@ -2196,6 +2217,9 @@ class AmbientApp:
 
         # BPM ブリンク開始
         self.root.after(100, self._bpm_blink_tick)
+
+        # ランプポーリング開始（ワーカースレッドの after() 呼び出しを排除）
+        self.root.after(100, self._lamp_tick)
 
 
     def _build_transport(self, parent):
@@ -2236,6 +2260,27 @@ class AmbientApp:
         self._sync_btn.pack(side='right', padx=(0, 6))
         self._sync_btn.bind('<Button-1>', lambda e: self._toggle_bpm_sync())
         self._clock_receiver = None
+
+        # MIDI 入力ポート選択（SYNC用）— クリックで順送り
+        port_row = tk.Frame(f, bg=C_PANEL)
+        port_row.pack(fill='x', pady=(4, 0))
+        tk.Label(port_row, text='MIDI IN', bg=C_PANEL, fg='#888899',
+                 font=('Helvetica', 8)).pack(side='left', padx=(4, 4))
+        self._midi_port_btn = tk.Label(
+            port_row, text='-- no ports --',
+            bg='#1e1e38', fg=C_TEXT,
+            font=('Helvetica', 8), padx=6, pady=3,
+            cursor='hand2', relief='flat', anchor='w', width=26)
+        self._midi_port_btn.pack(side='left', padx=(0, 4))
+        self._midi_port_btn.bind('<Button-1>', lambda e: self._cycle_midi_port())
+        refresh_btn = tk.Label(
+            port_row, text='⟳', bg=C_PANEL, fg='#4a9eff',
+            font=('Helvetica', 11), cursor='hand2')
+        refresh_btn.pack(side='left')
+        refresh_btn.bind('<Button-1>', lambda e: self._refresh_midi_ports())
+        self._midi_in_ports  = []
+        self._midi_port_idx  = 0
+        self._refresh_midi_ports()   # 起動時に一度スキャン
 
     def _build_key(self, parent):
         f = section(parent, 'Root Note')
@@ -2447,40 +2492,67 @@ class AmbientApp:
         self._evolve_btn.pack(fill='x', pady=(0, 6))
         self._evolve_btn.bind('<Button-1>', lambda e: self._on_evolve_toggle())
 
-        # XY パッド + Mod Wheel（横並び）
-        pad_outer = tk.Frame(f, bg=C_BG)
-        pad_outer.pack()
+        # ── KaossPad（中央） ─────────────────────────────────────────
+        self._kaoss_pad = KaossPad(f, command=self._on_kaoss)
+        self._kaoss_pad.pack(pady=(0, 4))
 
-        # ── Mod Wheel（左） ──────────────────────────────────────
-        mod_col = tk.Frame(pad_outer, bg=C_BG)
-        mod_col.pack(side='left', padx=(0, 6))
-        tk.Label(mod_col, text='MOD', bg=C_BG, fg='#6677aa',
-                 font=('Helvetica', 7, 'bold')).pack(pady=(0, 2))
+        # ── Mod Wheel（横・KaossPad直下） ────────────────────────────
+        mod_row = tk.Frame(f, bg=C_BG)
+        mod_row.pack(fill='x', pady=(0, 2))
+
+        tk.Label(mod_row, text='MOD', bg=C_BG, fg='#6677aa',
+                 font=('Helvetica', 7, 'bold'), width=4).pack(side='left')
 
         # チャンネル選択ボタン（1〜4）
         self._mod_ch_active = {0: True, 1: True, 2: True, 3: True}
         self._mod_ch_btns = {}
-        ch_row = tk.Frame(mod_col, bg=C_BG)
-        ch_row.pack(pady=(0, 3))
-        _ch_labels = {0: '1', 1: '2', 2: '3', 3: '4'}
         for ch in range(4):
-            b = tk.Label(ch_row, text=_ch_labels[ch],
+            b = tk.Label(mod_row, text=str(ch + 1),
                          bg='#2a2a5a', fg='#7c8fdd',
                          font=('Helvetica', 7, 'bold'),
-                         width=2, pady=1, cursor='hand2',
-                         relief='flat')
+                         width=2, pady=1, cursor='hand2', relief='flat')
             b.bind('<Button-1>', lambda e, c=ch: self._on_mod_ch_toggle(c))
             b.pack(side='left', padx=1)
             self._mod_ch_btns[ch] = b
 
+        self._mod_val_lbl = tk.Label(mod_row, text='0', bg=C_BG, fg='#445566',
+                                     font=('Helvetica', 7), width=3)
+        self._mod_val_lbl.pack(side='right', padx=(0, 4))
+
+        # AUTO ボタン
+        self._mod_auto_on = False
+        self._mod_auto_btn = tk.Label(
+            mod_row, text='AUTO', bg='#111128', fg='#334466',
+            font=('Helvetica', 7, 'bold'), width=5, pady=1,
+            cursor='hand2', relief='flat')
+        self._mod_auto_btn.pack(side='right', padx=(0, 4))
+        self._mod_auto_btn.bind('<Button-1>', lambda e: self._on_mod_auto_toggle())
+
+        # ── バー選択行（AUTO変化間隔）────────────────────────────────
+        mod_bars_row = tk.Frame(f, bg=C_BG)
+        mod_bars_row.pack(fill='x', pady=(1, 2))
+        tk.Label(mod_bars_row, text='BARS', bg=C_BG, fg='#445566',
+                 font=('Helvetica', 7)).pack(side='left', padx=(2, 4))
+        self._mod_auto_bars = 4          # デフォルト 4小節
+        self._mod_bars_btns = {}
+        for b in [1, 2, 4, 8, 16, 32]:
+            btn = tk.Label(mod_bars_row, text=str(b),
+                           bg='#1e1e38', fg='#445566',
+                           font=('Helvetica', 7, 'bold'),
+                           width=3, pady=1, cursor='hand2', relief='flat')
+            btn.bind('<Button-1>', lambda e, v=b: self._on_mod_bars(v))
+            btn.pack(side='left', padx=1)
+            self._mod_bars_btns[b] = btn
+        self._update_mod_bars_buttons(4)
+
         self._mod_wheel_var = tk.IntVar(value=0)
         self._mod_wheel = tk.Scale(
-            mod_col,
-            from_=127, to=0,
+            f,
+            from_=0, to=127,
             variable=self._mod_wheel_var,
-            orient='vertical',
-            length=KaossPad.H,
-            width=22,
+            orient='horizontal',
+            length=200,
+            width=18,
             showvalue=False,
             bg='#111128', fg='#6677aa',
             troughcolor='#0a0a1e',
@@ -2488,61 +2560,62 @@ class AmbientApp:
             highlightthickness=1,
             highlightbackground='#2a2a4a',
             command=self._on_mod_wheel)
-        self._mod_wheel.pack()
-        self._mod_val_lbl = tk.Label(mod_col, text='0', bg=C_BG, fg='#445566',
-                                     font=('Helvetica', 7))
-        self._mod_val_lbl.pack(pady=(2, 0))
+        self._mod_wheel.pack(pady=(0, 6))
 
-        # ── KaossPad（右） ───────────────────────────────────────
-        self._kaoss_pad = KaossPad(pad_outer, command=self._on_kaoss)
-        self._kaoss_pad.pack(side='left')
+        # ── パラメーター（2行・幅480px内に収める）─────────────────────
+        tk.Frame(f, bg='#2a2a4a', height=1).pack(fill='x', pady=(0, 5))
 
-        # Auto Mod モードボタン行
-        mode_row = tk.Frame(f, bg=C_BG)
-        mode_row.pack(fill='x', pady=(5, 2))
-        tk.Label(mode_row, text='MOD MODE', bg=C_BG, fg='#445566',
-                 font=('Helvetica', 7)).pack(side='left', padx=(0, 4))
+        def _centered_row(parent):
+            """横センタリングされた行フレームを返す"""
+            wrap = tk.Frame(parent, bg=C_BG)
+            wrap.pack(fill='x')
+            row = tk.Frame(wrap, bg=C_BG)
+            row.pack(expand=True)
+            return row
+
+        # ── 1行目: MOD MODE ボタン群 ─────────────────────────────────
+        row1 = _centered_row(f)
+        tk.Label(row1, text='MOD MODE', bg=C_BG, fg='#445566',
+                 font=('Helvetica', 7)).pack(side='left', padx=(0, 6))
         self._am_mode_btns = {}
         for key, label in [('random', 'RAND'), ('circle', '○'),
                             ('figure8', '∞'), ('spiral', '◌')]:
-            btn = tk.Label(mode_row, text=label,
+            btn = tk.Label(row1, text=label,
                            bg='#1e1e38', fg='#445566',
                            font=('Helvetica', 9, 'bold'),
-                           padx=7, pady=3, cursor='hand2')
+                           padx=8, pady=3, cursor='hand2')
             btn.bind('<Button-1>', lambda e, k=key: self._on_am_mode(k))
             btn.pack(side='left', padx=1)
             self._am_mode_btns[key] = btn
         self._update_am_mode_buttons('random')
 
-        # AUTO MOD スイッチ + 移動速度ノブ
-        am_row = tk.Frame(f, bg=C_BG)
-        am_row.pack(fill='x', pady=(2, 0))
+        # ── 2行目: Move Speed（単独センタリング）─────────────────────
+        row2 = _centered_row(f)
+        _, self._am_speed_knob = labeled_knob(
+            row2, 'Move Speed', 1, 100, 30,
+            '#ff9966', C_BG, self._on_am_speed)
+        self._am_speed_knob.master.pack()
+
+        # ── 3行目: AUTO MOD + POINTER ─────────────────────────────────
+        row3 = _centered_row(f)
         self._auto_mod_var = tk.BooleanVar(value=False)
         self._auto_mod_btn = tk.Label(
-            am_row, text='◎  AUTO MOD',
+            row3, text='◎  AUTO MOD',
             bg='#111128', fg='#445566',
             font=('Helvetica', 10, 'bold'),
-            padx=10, pady=6, cursor='hand2')
-        self._auto_mod_btn.pack(side='left')
+            padx=8, pady=5, cursor='hand2')
+        self._auto_mod_btn.pack(side='left', padx=(0, 12))
         self._auto_mod_btn.bind('<Button-1>', lambda e: self._on_auto_mod_toggle())
-        _, self._am_speed_knob = labeled_knob(
-            am_row, 'Move Speed', 1, 100, 30,
-            '#ff9966', C_BG, self._on_am_speed)
-        self._am_speed_knob.master.pack(side='right', padx=(0, 4))
 
-        # POINTER デザイン選択行
-        tk.Frame(f, bg='#2a2a4a', height=1).pack(fill='x', pady=(8, 5))
-        sat_row = tk.Frame(f, bg=C_BG)
-        sat_row.pack(fill='x', pady=(0, 4))
-        tk.Label(sat_row, text='POINTER', bg=C_BG, fg='#445566',
+        tk.Label(row3, text='POINTER', bg=C_BG, fg='#445566',
                  font=('Helvetica', 7)).pack(side='left', padx=(0, 4))
         self._sat_type_btns = {}
         for key, label in [('sputnik1', 'SP-1'), ('sputnik3', 'SP-3'),
                             ('hawk', '鷹'), ('claude', 'CLaUDE')]:
-            btn = tk.Label(sat_row, text=label,
+            btn = tk.Label(row3, text=label,
                            bg='#1e1e38', fg='#445566',
                            font=('Helvetica', 9, 'bold'),
-                           padx=8, pady=3, cursor='hand2')
+                           padx=6, pady=3, cursor='hand2')
             btn.bind('<Button-1>', lambda e, k=key: self._on_sat_type(k))
             btn.pack(side='left', padx=1)
             self._sat_type_btns[key] = btn
@@ -2983,45 +3056,46 @@ class AmbientApp:
 
     def _float_tick(self):
         """周囲パネルをサイン波で浮遊させる。ホバー中はベース位置へイーズバック。"""
-        import time as _time
-        t = _time.time()
+        t = time.perf_counter()
 
-        # カーソル下のウィジェットを取得
-        try:
-            wx = self.root.winfo_pointerx()
-            wy = self.root.winfo_pointery()
-            widget_under = self.root.winfo_containing(wx, wy)
-        except Exception:
-            widget_under = None
+        # ホバー判定は 6フレームに1回（約96ms）— winfo_containing は重いので間引く
+        self._float_frame = getattr(self, '_float_frame', 0) + 1
+        if self._float_frame >= 6:
+            self._float_frame = 0
+            try:
+                widget_under = self.root.winfo_containing(
+                    self.root.winfo_pointerx(), self.root.winfo_pointery())
+            except Exception:
+                widget_under = None
+            for p in self._float_panels:
+                h = False
+                w = widget_under
+                while w is not None:
+                    if w is p['frame']:
+                        h = True
+                        break
+                    w = getattr(w, 'master', None)
+                p['hovered'] = h
 
         mc = self._radial_canvas
         for p in self._float_panels:
-            # ウィジェット階層を辿ってホバー判定
-            hovered = False
-            w = widget_under
-            while w is not None:
-                if w is p['frame']:
-                    hovered = True
-                    break
-                w = getattr(w, 'master', None)
-
-            try:
-                cx, cy = mc.coords(p['item_id'])
-            except Exception:
-                continue
-
-            if hovered:
-                # ベース位置へゆっくりイーズバック（X・Y 両軸）
-                new_x = cx + (p['base_x'] - cx) * 0.12
-                new_y = cy + (p['base_y'] - cy) * 0.12
-                mc.coords(p['item_id'], new_x, new_y)
+            if p.get('hovered', False):
+                # ベース位置へイーズバック（キャッシュ座標を使用）
+                cx = p.get('cur_x', p['base_x'])
+                cy = p.get('cur_y', p['base_y'])
+                nx = cx + (p['base_x'] - cx) * 0.15
+                ny = cy + (p['base_y'] - cy) * 0.15
             else:
                 # X・Y 独立サイン波で無重力ドリフト
                 dx = p['amp_x'] * math.sin(t * p['speed_x'] + p['phase_x'])
                 dy = p['amp_y'] * math.sin(t * p['speed_y'] + p['phase_y'])
-                mc.coords(p['item_id'], p['base_x'] + dx, p['base_y'] + dy)
+                nx = p['base_x'] + dx
+                ny = p['base_y'] + dy
+            p['cur_x'] = nx
+            p['cur_y'] = ny
+            mc.coords(p['item_id'], nx, ny)
 
-        self.root.after(30, self._float_tick)
+        self.root.after(16, self._float_tick)
 
     def _build_layers(self, parent):
         f = section(parent, 'Layers')
@@ -3418,6 +3492,29 @@ class AmbientApp:
         self._log_text.pack(fill='both', expand=True)
 
     # ---- イベントハンドラ --------------------------------
+    def _refresh_midi_ports(self):
+        """利用可能なMIDI入力ポートをスキャンしてボタン表示を更新"""
+        ports = MidiClockReceiver.get_ports()
+        self._midi_in_ports = ports
+        if ports:
+            # 現在のインデックスが範囲外なら先頭へ
+            if self._midi_port_idx >= len(ports):
+                self._midi_port_idx = 0
+            self._midi_port_btn.config(text=ports[self._midi_port_idx])
+        else:
+            self._midi_port_idx = 0
+            self._midi_port_btn.config(text='-- no ports --')
+        self._log(f"[MIDI] input ports: {ports}")
+
+    def _cycle_midi_port(self):
+        """クリックするたびに次のMIDIポートへ切り替え"""
+        ports = self._midi_in_ports
+        if not ports:
+            self._refresh_midi_ports()
+            return
+        self._midi_port_idx = (self._midi_port_idx + 1) % len(ports)
+        self._midi_port_btn.config(text=ports[self._midi_port_idx])
+
     def _toggle_bpm_sync(self):
         """OFF → SLAVE → MASTER → OFF とサイクル"""
         # 現在の状態を停止
@@ -3429,22 +3526,28 @@ class AmbientApp:
             self._clock_sender = None
 
         if self._sync_mode == 'off':
-            # → SLAVE: Logic Pro がマスター、AMG が追従
+            # → SLAVE: 選択ポートのマスターに追従
+            ports    = getattr(self, '_midi_in_ports', [])
+            port_idx = getattr(self, '_midi_port_idx', None)
+            if port_idx is not None and port_idx >= len(ports):
+                port_idx = None
+            sel = ports[port_idx] if ports and port_idx is not None else '(auto)'
             receiver = MidiClockReceiver(self._on_clock_bpm)
-            if receiver.start(log_fn=self._log):
+            if receiver.start(log_fn=self._log, port_idx=port_idx):
                 self._clock_receiver = receiver
                 self._sync_mode = 'slave'
                 self._sync_btn.config(bg='#00b894', fg='#0f0f1e', text='◀ SLAVE')
                 self._bpm_knob.color = '#444466'
                 self._bpm_knob._draw()
-                self._log('--- SYNC: SLAVE (Logic Pro → AMG) ---')
-                self._log('※ Logic Pro を再生するとクロックが届きます')
+                port_name = sel or '(auto)'
+                self._log(f'--- SYNC: SLAVE [{port_name}] ---')
+                self._log('※ マスター機器/DAWを再生するとクロックが届きます')
             else:
                 self._sync_mode = 'off'
-                self._log('--- SYNC ERROR: IAC Driver が見つかりません ---')
+                self._log('--- SYNC ERROR: MIDIポートを開けませんでした ---')
 
         elif self._sync_mode == 'slave':
-            # → MASTER: AMG がマスター、Logic Pro が追従
+            # → MASTER: AMG がマスター、外部機器 / DAW が追従
             self._bpm_knob.color = C_TEXT
             self._bpm_knob._draw()
             sender = MidiClockSender()
@@ -3452,7 +3555,7 @@ class AmbientApp:
             self._clock_sender = sender
             self._sync_mode = 'master'
             self._sync_btn.config(bg='#ffa94d', fg='#0f0f1e', text='MASTER ▶')
-            self._log('--- SYNC: MASTER (AMG → Logic Pro) ---')
+            self._log('--- SYNC: MASTER (AMG → 外部機器/DAW) ---')
 
         else:
             # → OFF
@@ -3468,6 +3571,10 @@ class AmbientApp:
         with STATE._lock:
             STATE.bpm = bpm
         # ノブ表示だけ UIスレッド経由
+        self.root.after(0, lambda: self._bpm_knob.set(bpm))
+
+    def _on_evolve_bpm(self, bpm):
+        """Auto Evolveスレッドから呼ばれる — GUIノブを更新"""
         self.root.after(0, lambda: self._bpm_knob.set(bpm))
 
     def _on_bpm(self, val):
@@ -3492,6 +3599,17 @@ class AmbientApp:
             bpm = max(30, min(300, bpm))
             with STATE._lock: STATE.bpm = bpm
             self._bpm_knob.set(bpm)
+
+    def _lamp_tick(self):
+        """ワーカースレッドの _lamp_notes をポーリングしてランプ表示を更新。
+        after(0,...) をスレッドから呼ぶ代わりにメインスレッドが定期取得する方式。"""
+        for ch in range(4):
+            if ch in _lamp_fns:
+                try:
+                    _lamp_fns[ch](_lamp_notes[ch] > 0)
+                except Exception:
+                    pass
+        self.root.after(80, self._lamp_tick)
 
     def _bpm_blink_tick(self):
         """TAPボタンを現在BPMで赤く点滅させる（常時動作）"""
@@ -3662,6 +3780,51 @@ class AmbientApp:
                     midi.send_message([0xB0 | ch, 1, v])
         except Exception:
             pass
+
+    def _on_mod_bars(self, bars):
+        """Mod AUTO の変化間隔（小節数）を変更。"""
+        self._mod_auto_bars = bars
+        self._update_mod_bars_buttons(bars)
+
+    def _update_mod_bars_buttons(self, selected):
+        for b, btn in self._mod_bars_btns.items():
+            if b == selected:
+                btn.config(bg='#2a4a7a', fg='#7cb4ff')
+            else:
+                btn.config(bg='#1e1e38', fg='#445566')
+
+    def _on_mod_auto_toggle(self):
+        """Mod Wheel AUTO のオン/オフ切り替え。"""
+        self._mod_auto_on = not self._mod_auto_on
+        if self._mod_auto_on:
+            self._mod_auto_btn.config(bg='#1a1a2e', fg='#ff9966')
+            self._mod_auto_current = float(self._mod_wheel_var.get())
+            self._mod_auto_target  = self._mod_auto_current
+            self._mod_auto_tick()        # イーズループ開始
+            self._mod_auto_bar_tick()    # 小節タイマー開始
+        else:
+            self._mod_auto_btn.config(bg='#111128', fg='#334466')
+
+    def _mod_auto_bar_tick(self):
+        """小節ごとに Mod Wheel の目標値を更新する。"""
+        if not self._mod_auto_on:
+            return
+        # 現在値から ±40 の範囲でランダムにターゲットを設定
+        drift = random.uniform(-40, 40)
+        self._mod_auto_target = max(0.0, min(127.0, self._mod_auto_current + drift))
+        # 次の発火は選択小節数後
+        interval = bars_to_ms(self._mod_auto_bars, STATE.bpm)
+        self.root.after(interval, self._mod_auto_bar_tick)
+
+    def _mod_auto_tick(self):
+        """50ms ごとに現在値をターゲットへイーズさせる。"""
+        if not self._mod_auto_on:
+            return
+        self._mod_auto_current += (self._mod_auto_target - self._mod_auto_current) * 0.05
+        new_val = int(round(self._mod_auto_current))
+        self._mod_wheel_var.set(new_val)
+        self._on_mod_wheel(new_val)
+        self.root.after(50, self._mod_auto_tick)
 
     def _on_auto_mod_toggle(self):
         v = not self._auto_mod_var.get()
@@ -4267,7 +4430,7 @@ class AmbientApp:
         self._melody  = MelodyLayer(1, 1, 'melody',  0.75, 'Melody ', self._log)
         self._sparkle = MelodyLayer(2, 3, 'sparkle', 0.55, 'Sparkle', self._log)
         self._chord   = ChordLayer(self._log)
-        self._evo     = EvolutionController(self._log)
+        self._evo     = EvolutionController(self._log, on_bpm_change=self._on_evolve_bpm)
 
         self._drone.start()
         threading.Timer(2.0, self._melody.start).start()
