@@ -14,5 +14,5 @@ echo "==> Building DJApp.app..."
 "$PYINSTALLER" dj_app.spec --clean --noconfirm
 
 echo ""
-echo "Done! App is at: dist/DJApp.app"
-echo "To run: open dist/DJApp.app"
+echo "Done! App is at: dist/LuchaPinchadiscos.app"
+echo "To run: open dist/LuchaPinchadiscos.app"
